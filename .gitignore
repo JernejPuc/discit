@@ -1,0 +1,6 @@
+.vscode
+data
+runs
+src/discit/__pycache__
+src/discit.egg-info
+temp
