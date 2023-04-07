@@ -185,7 +185,7 @@ class PPG:
             running_time = perf_counter() - starting_time
 
             remaining_time = min(
-                int(running_time * (self.n_epochs - epoch_step) / (epoch_step - starting_step)),
+                int(running_time * (self.n_epochs - epoch_step + 1) / (epoch_step - starting_step)),
                 self.MAX_DISP_SECONDS)
 
             # Main phase
@@ -335,10 +335,9 @@ class PPG:
 
                 # Capture computational graph
                 if self.update_main_single_accel is None:
-                    mem = self.accel_main(batches, mem, full_input_list)
+                    self.accel_main(batches, mem, full_input_list)
 
-                else:
-                    mem = tuple(self.update_main_single_accel(full_input_list))
+                mem = tuple(self.update_main_single_accel(full_input_list))
 
             else:
                 self.optimiser.zero_grad()
@@ -347,8 +346,7 @@ class PPG:
             self.scheduler.step()
 
         # Update print-out info
-        self.reward /= self.n_rollout_steps
-        self.score = self.stats.get('env_score', self.reward).item()
+        self.score = self.stats.get('env_score', self.reward).item() / self.n_rollout_steps
 
         return tuple([m.detach() for m in mem])
 
@@ -386,7 +384,7 @@ class PPG:
 
             # Stats for logging
             with torch.no_grad():
-                reward = batch['rew'].median()
+                reward = batch['rew'].mean()
                 self.reward += reward
 
                 stats['col_act_mean'] += act.loc.mean()
@@ -409,12 +407,7 @@ class PPG:
 
         return mem
 
-    def accel_main(
-        self,
-        batches: 'list[TensorDict]',
-        mem: 'tuple[Tensor, ...]',
-        inputs: 'list[Tensor]'
-    ) -> 'tuple[Tensor, ...]':
+    def accel_main(self, batches: 'list[TensorDict]', mem: 'tuple[Tensor, ...]', inputs: 'list[Tensor]'):
 
         # Warmup on side stream
         s = cuda.Stream()
@@ -475,8 +468,6 @@ class PPG:
             warmup_tensor_list=(),
             single_input=True)
 
-        return tuple([m.clone() for m in self.accel_graphs['main']['out']])
-
     def update_aux(self) -> 'tuple[Tensor, ...]':
         """
         Iterate over sequences of batches in combined rollouts and update
@@ -506,10 +497,9 @@ class PPG:
 
                 # Capture computational graph
                 if self.update_aux_single_accel is None:
-                    mem = self.accel_aux(batches, mem, full_input_list)
+                    self.accel_aux(batches, mem, full_input_list)
 
-                else:
-                    mem = tuple(self.update_aux_single_accel(full_input_list))
+                mem = tuple(self.update_aux_single_accel(full_input_list))
 
             else:
                 self.optimiser.zero_grad()
@@ -518,8 +508,7 @@ class PPG:
             self.scheduler.step()
 
         # Update print-out info
-        self.reward /= self.n_rollout_steps * self.n_main_iters
-        self.score = self.stats.get('env_score', self.reward).item()
+        self.score = self.stats.get('env_score', self.reward).item() / (self.n_rollout_steps * self.n_main_iters)
 
         return tuple([m.detach() for m in mem])
 
@@ -549,7 +538,7 @@ class PPG:
 
             # Stats for logging
             with torch.no_grad():
-                reward = batch['rew'].median()
+                reward = batch['rew'].mean()
                 self.reward += reward
 
                 stats['aux_loss'] += full_loss
@@ -565,12 +554,7 @@ class PPG:
 
         return mem
 
-    def accel_aux(
-        self,
-        batches: 'list[TensorDict]',
-        mem: 'tuple[Tensor, ...]',
-        inputs: 'list[Tensor]'
-    ) -> 'tuple[Tensor, ...]':
+    def accel_aux(self, batches: 'list[TensorDict]', mem: 'tuple[Tensor, ...]', inputs: 'list[Tensor]'):
 
         # NOTE: Repeating warmup here resulted in illegal CUDA memory access errors
         # Besides that, warmup before the main phase should suffice
@@ -595,5 +579,3 @@ class PPG:
             inputs,
             warmup_tensor_list=(),
             single_input=True)
-
-        return tuple([m.clone() for m in self.accel_graphs['aux']['out']])

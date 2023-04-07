@@ -1,7 +1,7 @@
 """Distributions"""
 
+import math
 from functools import cached_property
-from math import log, pi, sqrt
 from typing import Callable
 
 import torch
@@ -10,15 +10,15 @@ from torch.nn.functional import logsigmoid, log_softmax, softplus
 
 
 class ActionDistrTemplate:
-    entropy: 'Tensor | Callable[[], Tensor]'
-    log_prob: 'Tensor | Callable[[Tensor], Tensor]'
-    kl_div: 'Tensor | Callable[[ActionDistrTemplate], Tensor]'
-    sample: 'Tensor | Callable[[], Tensor]'
+    entropy: Tensor
+    log_prob: 'Callable[[Tensor], Tensor]'
+    kl_div: 'Callable[[ActionDistrTemplate], Tensor]'
+    sample: 'Callable[[], Tensor]'
 
 
 class ValueDistrTemplate:
     mean: Tensor
-    log_prob: 'Tensor | Callable[[Tensor], Tensor]'
+    log_prob: 'Callable[[Tensor], Tensor]'
 
 
 class IndepNormal(ActionDistrTemplate):
@@ -28,7 +28,7 @@ class IndepNormal(ActionDistrTemplate):
     (no correlations between variables are intended).
     """
 
-    _LOG_SQRT_2PI = 0.5 * (log(2.) + log(pi))
+    _LOG_SQRT_2PI = 0.5 * (math.log(2.) + math.log(math.pi))
     _LOG_SQRT_2PIE = 0.5 + _LOG_SQRT_2PI
 
     def __init__(self, loc: Tensor, scale: Tensor, sample: Tensor = None, pseudo: bool = False):
@@ -85,10 +85,10 @@ class TruncIndepNormal(ActionDistrTemplate):
     https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8947456/
     """
 
-    _LOG_SQRT_2_DIV_PI = 0.5 * (log(2.) - log(pi))
+    _LOG_SQRT_2_DIV_PI = 0.5 * (math.log(2.) - math.log(math.pi))
     _LOG_SQRT_PIE_DIV_2 = 0.5 - _LOG_SQRT_2_DIV_PI
-    _SQRT_2_DIV_PI = sqrt(2. / pi)
-    _SQRT_2 = sqrt(2)
+    _SQRT_2_DIV_PI = math.sqrt(2. / math.pi)
+    _SQRT_2 = math.sqrt(2)
 
     def __init__(
         self,
@@ -211,9 +211,12 @@ class TruncIndepNormal(ActionDistrTemplate):
 
 
 class OnlyMean(ValueDistrTemplate):
+    """Not a probability distribution, but is a simple and useful default."""
+
     def __init__(self, mean: Tensor):
         self.mean = mean
 
+    # TODO: Term inconsistency
     def log_prob(self, values: Tensor) -> Tensor:
         return -(self.mean.flatten() - values)**2
 
