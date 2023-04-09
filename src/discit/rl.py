@@ -239,6 +239,8 @@ class PPG:
         den_main = self.n_rollout_steps * self.n_main_iters
         den_aux = den_main * max(1, self.n_aux_iters)
 
+        env_step = epoch_step * den_main
+
         # To keep loop simple
         self.stats['main_adv_mean'] *= den_main / self.n_main_iters
         self.stats['main_adv_std'] *= den_main / self.n_main_iters
@@ -247,7 +249,7 @@ class PPG:
         den_aux *= self.log_interval
 
         for key, val in tuple(self.stats.items()):
-            self.write(key, val.item() / (den_aux if key.startswith('aux') else den_main), epoch_step)
+            self.write(key, val.item() / (den_aux if key.startswith('aux') else den_main), env_step)
             self.stats[key].zero_()
 
     def checkpoint(self, epoch_step: int, branch: bool = False):

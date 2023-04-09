@@ -18,6 +18,7 @@ class NAdamW(Optimizer):
         beta_products: 'tuple[float, float]' = (1., 1.),
         eps: float = 1e-6,
         weight_decay: float = 1e-2,
+        clip_grad_value: float = 4.,
         device: 'str | torch.device' = 'cuda'
     ):
         defaults = dict(
@@ -29,6 +30,7 @@ class NAdamW(Optimizer):
             beta2_product=torch.tensor(beta_products[1], dtype=torch.float32, device=device),
             eps=torch.tensor(eps, dtype=torch.float32, device=device),
             weight_decay=(torch.tensor(weight_decay, dtype=torch.float32, device=device) if weight_decay else None),
+            clip_grad_value=(clip_grad_value if clip_grad_value else None),
             step=torch.tensor(0, dtype=torch.int64, device=device))
 
         super().__init__(params, defaults)
@@ -59,6 +61,7 @@ class NAdamW(Optimizer):
             beta2_product = group['beta2_product']
             eps = group['eps']
             weight_mul = (1. - lr * group['weight_decay']) if group['weight_decay'] is not None else None
+            clip_grad_value = group['clip_grad_value'] if group['clip_grad_value'] is not None else None
 
             # Update
             group['step'] += 1
@@ -92,6 +95,10 @@ class NAdamW(Optimizer):
 
                 param: Tensor = p
                 grad: Tensor = p.grad
+
+                if clip_grad_value is not None:
+                    grad.data.nan_to_num_(0.)
+                    grad.data.clip_(-clip_grad_value, clip_grad_value)
 
                 # Decoupled weight decay
                 if weight_mul is not None:

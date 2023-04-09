@@ -483,11 +483,11 @@ class ExperienceBuffer:
         advantages = torch.stack([batch['adv'] for batch in self.batches], dim=1)
 
         # NOTE: Standardisation works best over the whole rollout (more samples, fewer outliers)
-        # NOTE: Div. by scale is clipped to limit the noise of sparse rewards (max. 10x larger)
+        # NOTE: Div. by scale is clipped to limit the noise of sparse rewards (max. 20x larger)
         adv_mean = advantages.mean()
         adv_std = advantages.std()
 
-        advantages = (advantages - adv_mean) / torch.clip(adv_std, 0.1)
+        advantages = (advantages - adv_mean) / torch.clip(adv_std, 0.05)
 
         for i, batch in enumerate(self.batches):
             batch['adv'] = advantages[:, i]

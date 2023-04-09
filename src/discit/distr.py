@@ -26,20 +26,35 @@ class IndepNormal(ActionDistrTemplate):
     Multivariate normal with diagonal covariance matrix,
     i.e. independent normal axes, where only diagonal elements are non-zero
     (no correlations between variables are intended).
+
+    Includes arguments for bounding loc and scale to mitigate potential
+    instabilities.
     """
 
     _LOG_SQRT_2PI = 0.5 * (math.log(2.) + math.log(math.pi))
     _LOG_SQRT_2PIE = 0.5 + _LOG_SQRT_2PI
 
-    def __init__(self, loc: Tensor, scale: Tensor, sample: Tensor = None, pseudo: bool = False):
-        self.mode = self.mean = self.loc = loc
+    def __init__(
+        self,
+        loc: Tensor,
+        scale: Tensor,
+        sample: Tensor = None,
+        pseudo: bool = False,
+        tanh_arg: float = 3.,
+        scale_min: float = 0.01,
+        scale_bias: float = -math.log(3.)   # sigmoid(0 - log(3)) = 0.25
+    ):
+        self.scale_min = scale_min
+        self.scale_bias = scale_bias
 
         # Shadow cached properties
         if not pseudo:
+            self.mode = self.mean = self.loc = loc
             self.scale = scale
             self.pseudo_scale = None
 
         else:
+            self.mode = self.mean = self.loc = (loc / tanh_arg).tanh() * tanh_arg
             self.pseudo_scale = scale
 
         if sample is not None:
@@ -47,11 +62,11 @@ class IndepNormal(ActionDistrTemplate):
 
     @cached_property
     def log_scale(self) -> Tensor:
-        return self.scale.log() if self.pseudo_scale is None else logsigmoid(self.pseudo_scale)
+        return self.scale.log()
 
     @cached_property
     def scale(self) -> Tensor:
-        return torch.sigmoid(self.pseudo_scale)
+        return (self.pseudo_scale + self.scale_bias).sigmoid() + self.scale_min
 
     @cached_property
     def var(self) -> Tensor:
