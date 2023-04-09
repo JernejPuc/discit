@@ -185,7 +185,7 @@ class PPG:
             running_time = perf_counter() - starting_time
 
             remaining_time = min(
-                int(running_time * (self.n_epochs - epoch_step + 1) / (epoch_step - starting_step)),
+                int(running_time * (self.n_epochs - epoch_step + 1) / max(1, epoch_step - 1 - starting_step)),
                 self.MAX_DISP_SECONDS)
 
             # Main phase
@@ -194,7 +194,7 @@ class PPG:
 
                 obs, mem = self.collect(obs, mem)
 
-                mem = self.update_main()
+                mem = self.update_main(i)
 
                 self.main_buffer.clear()
 
@@ -308,7 +308,7 @@ class PPG:
 
         return obs, mem
 
-    def update_main(self) -> 'tuple[Tensor, ...]':
+    def update_main(self, iter_num: int) -> 'tuple[Tensor, ...]':
         """
         Iterate over sequences of batches in a rollout and update
         model params. according to the main objective with epochwise TBPTT.
@@ -348,7 +348,7 @@ class PPG:
             self.scheduler.step()
 
         # Update print-out info
-        self.score = self.stats.get('env_score', self.reward).item() / self.n_rollout_steps
+        self.score = self.stats.get('env_score', self.reward).item() / (self.n_rollout_steps * iter_num)
 
         return tuple([m.detach() for m in mem])
 
@@ -367,7 +367,13 @@ class PPG:
             old_act: ActionDistrTemplate = self.model.get_distr(batch['act'])
             act_sample = old_act.sample
 
-            ratio = (act.log_prob(act_sample) - old_act.log_prob(act_sample)).exp()
+            act_log_prob = act.log_prob(act_sample)
+            old_act_log_prob = old_act.log_prob(act_sample)
+
+            # Bound ratio to [0.05, 20] for stability
+            old_act_log_prob = old_act_log_prob.clamp(act_log_prob-3., act_log_prob+3.)
+
+            ratio = (act_log_prob - old_act_log_prob).exp()
 
             policy_loss = -torch.minimum(
                 batch['adv'] * ratio,

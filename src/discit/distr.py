@@ -90,6 +90,94 @@ class IndepNormal(ActionDistrTemplate):
         return torch.normal(self.loc, self.scale)
 
 
+class ClipIndepNormal(ActionDistrTemplate):
+    """
+    Clipped multivariate normal with diagonal covariance matrix,
+    i.e. independent normal axes, where only diagonal elements are non-zero
+    (no correlations between variables are intended).
+
+    Includes arguments for bounding loc and scale to mitigate potential
+    instabilities.
+
+    TODO: Formulae.
+    """
+
+    _LOG_SQRT_2PI = 0.5 * (math.log(2.) + math.log(math.pi))
+    _LOG_SQRT_2PIE = 0.5 + _LOG_SQRT_2PI
+    _LOG_05 = math.log(0.5)
+    _SQRT_2 = math.sqrt(2)
+
+    def __init__(
+        self,
+        loc: Tensor,
+        scale: Tensor,
+        sample: Tensor = None,
+        pseudo: bool = False,
+        tanh_arg: float = 3.,
+        scale_min: float = 0.01,
+        scale_bias: float = -math.log(3.),  # sigmoid(0 - log(3)) = 0.25
+        low: float = -1.,
+        high: float = 1.
+    ):
+        self.scale_min = scale_min
+        self.scale_bias = scale_bias
+        self.low = low
+        self.high = high
+
+        # Shadow cached properties
+        if not pseudo:
+            self.mode = self.mean = self.loc = loc
+            self.scale = scale
+            self.pseudo_scale = None
+
+        else:
+            self.mode = self.mean = self.loc = (loc / tanh_arg).tanh() * tanh_arg
+            self.pseudo_scale = scale
+
+        if sample is not None:
+            self.sample = sample
+
+    @cached_property
+    def log_scale(self) -> Tensor:
+        return self.scale.log()
+
+    @cached_property
+    def scale(self) -> Tensor:
+        return (self.pseudo_scale + self.scale_bias).sigmoid() + self.scale_min
+
+    @cached_property
+    def _sqrt_2_scale(self) -> Tensor:
+        return self._SQRT_2 * self.scale
+
+    @cached_property
+    def var(self) -> Tensor:
+        return self.scale ** 2
+
+    @cached_property
+    def _dbl_var(self) -> Tensor:
+        return 2. * self.var
+
+    @cached_property
+    def entropy(self) -> Tensor:
+        return (self._LOG_SQRT_2PIE + self.log_scale).sum(-1)
+
+    def log_prob(self, values: Tensor) -> Tensor:
+        log_prob_b = self._LOG_05 + ((1. + 1e-6) - ((self.high - self.loc) / self._sqrt_2_scale).erf()).log()
+        log_prob_a = self._LOG_05 + ((1. + 1e-6) + ((self.low - self.loc) / self._sqrt_2_scale).erf()).log()
+
+        log_prob = -(self._LOG_SQRT_2PI + self.log_scale + ((values - self.loc)**2) / self._dbl_var)
+        log_prob = log_prob.lerp(log_prob_b, (values > self.high).float())
+        log_prob = log_prob.lerp(log_prob_a, (values < self.low).float())
+
+        return log_prob.sum(-1)
+
+    def kl_div(self, othr: 'ClipIndepNormal') -> Tensor:
+        return (othr.log_scale - self.log_scale + ((self.var + (self.loc - othr.loc)**2) / othr._dbl_var) - 0.5).sum(-1)
+
+    def sample(self) -> Tensor:
+        return torch.normal(self.loc, self.scale).clamp_(self.low, self.high)
+
+
 class TruncIndepNormal(ActionDistrTemplate):
     """
     Truncated multivariate normal with diagonal covariance matrix,
