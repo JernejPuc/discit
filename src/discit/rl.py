@@ -22,13 +22,14 @@ from .track import CheckpointTracker
 class ActorCriticTemplate(Module, ABC):
     MODE_LEARNER = 0
     MODE_COLLECTOR = 1
-    MODE_ACTOR = 2
-    MODE_CRITIC = 3
+    MODE_RECOLLECTOR = 2
+    MODE_ACTOR = 3
+    MODE_CRITIC = 4
 
     def __init__(self):
         Module.__init__(self)
 
-        self.fwd_map = (self.fwd_learner, self.fwd_collector, self.fwd_actor, self.fwd_critic)
+        self.fwd_map = (self.fwd_learner, self.fwd_collector, self.fwd_recollector, self.fwd_actor, self.fwd_critic)
 
     @abstractmethod
     def init_mem(self, batch_size: int, detach: bool) -> 'tuple[Tensor, ...]':
@@ -63,7 +64,16 @@ class ActorCriticTemplate(Module, ABC):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], ActionDistrTemplate, Tensor, Tensor, tuple[Tensor, ...]]':
+    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
+        raise NotImplementedError
+
+    @abstractmethod
+    def fwd_recollector(
+        self,
+        act: 'tuple[Tensor, ...]',
+        obs: 'tuple[Tensor, ...]',
+        mem: 'tuple[Tensor, ...]'
+    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
         raise NotImplementedError
 
     @abstractmethod
@@ -79,6 +89,8 @@ class ActorCriticTemplate(Module, ABC):
 
 
 class PPG:
+    """Implementation of phasic policy gradient algorithm focusing on recurrent models."""
+
     MAX_DISP_SECONDS = 99*24*3600
 
     def __init__(
@@ -104,7 +116,8 @@ class PPG:
         entropy_weight: float = 3e-4,
         log_dir: str = 'runs',
         accelerate: bool = True,
-        replay_rollout: bool = True
+        replay_rollout: bool = True,
+        update_returns: bool = True
     ):
         assert ckpt_tracker.model is not None and ckpt_tracker.optimiser is not None
 
@@ -127,6 +140,7 @@ class PPG:
         self.checkpoint_interval = ckpt_epoch_interval
         self.branch_interval = branch_epoch_interval
 
+        self.update_returns = update_returns
         self.replay_rollout = replay_rollout
         self.n_rollout_steps = n_rollout_steps
         self.n_truncated_steps = n_truncated_steps
@@ -148,21 +162,21 @@ class PPG:
         new_zero_tensor = self.reward.clone
 
         self.stats = {
-            'col_act_mean': new_zero_tensor(),
-            'col_act_std': new_zero_tensor(),
-            'col_val_mean': new_zero_tensor(),
-            'main_loss': new_zero_tensor(),
-            'main_policy': new_zero_tensor(),
-            'main_value': new_zero_tensor(),
-            'main_entropy': new_zero_tensor(),
-            'main_ratio_diff': new_zero_tensor(),
-            'main_adv_mean': new_zero_tensor(),
-            'main_adv_std': new_zero_tensor(),
-            'aux_loss': new_zero_tensor(),
-            'aux_value': new_zero_tensor(),
-            'aux_kl_div': new_zero_tensor(),
-            'env_reward': new_zero_tensor(),
-            'env_resets': new_zero_tensor()}
+            'Out/act_mean': new_zero_tensor(),
+            'Out/act_std': new_zero_tensor(),
+            'Out/val_mean': new_zero_tensor(),
+            'Env/reward': new_zero_tensor(),
+            'Env/resets': new_zero_tensor(),
+            'Main/loss': new_zero_tensor(),
+            'Main/policy': new_zero_tensor(),
+            'Main/value': new_zero_tensor(),
+            'Main/entropy': new_zero_tensor(),
+            'Main/ratio_diff': new_zero_tensor(),
+            'GAE/adv_mean': new_zero_tensor(),
+            'GAE/adv_std': new_zero_tensor(),
+            'Aux/loss': new_zero_tensor(),
+            'Aux/value': new_zero_tensor(),
+            'Aux/kl_div': new_zero_tensor()}
 
     def run(self):
         """
@@ -202,6 +216,9 @@ class PPG:
             for i in range(1, self.n_aux_iters+1):
                 self.print_progress(progress, remaining_time, epoch_step, i, False)
 
+                if self.update_returns:
+                    self.recollect(obs)
+
                 mem = self.update_aux()
 
             self.aux_buffer.clear()
@@ -218,6 +235,7 @@ class PPG:
                 self.checkpoint(epoch_step)
 
         self.checkpoint(epoch_step)
+        self.writer.close()
 
     def print_progress(
         self,
@@ -236,21 +254,24 @@ class PPG:
             end='')
 
     def log(self, epoch_step: int):
-        den_main = self.n_rollout_steps * self.n_main_iters
+        den_main = self.n_rollout_steps * self.n_main_iters * self.log_interval
         den_aux = den_main * max(1, self.n_aux_iters)
+        den_gae = self.n_main_iters * self.log_interval
 
         env_step = epoch_step * den_main
 
-        # To keep loop simple
-        self.stats['main_adv_mean'] *= den_main / self.n_main_iters
-        self.stats['main_adv_std'] *= den_main / self.n_main_iters
+        for key, val in self.stats.items():
+            if key.startswith('Aux'):
+                den = den_aux
 
-        den_main *= self.log_interval
-        den_aux *= self.log_interval
+            elif key.startswith('GAE'):
+                den = den_gae
 
-        for key, val in tuple(self.stats.items()):
-            self.write(key, val.item() / (den_aux if key.startswith('aux') else den_main), env_step)
-            self.stats[key].zero_()
+            else:
+                den = den_main
+
+            self.write(key, val.item() / den, env_step)
+            val.zero_()
 
     def checkpoint(self, epoch_step: int, branch: bool = False):
         update_step = self.scheduler.step_ctr
@@ -291,7 +312,7 @@ class PPG:
 
                 # Add env. info. to logged metrics
                 for key, val in info.items():
-                    key = f'env_{key}'
+                    key = f'Env/{key}'
 
                     if key not in self.stats:
                         self.stats[key] = torch.tensor(0., device=self.ckpter.device)
@@ -303,10 +324,36 @@ class PPG:
 
             adv_mean, adv_std = self.main_buffer.label(values, self.discount_factor, self.gae_lambda)
 
-            self.stats['main_adv_mean'] += adv_mean
-            self.stats['main_adv_std'] += adv_std
+            self.stats['GAE/adv_mean'] += adv_mean
+            self.stats['GAE/adv_std'] += adv_std
 
         return obs, mem
+
+    def recollect(self, final_obs: 'tuple[Tensor, ...]'):
+        mem = self.aux_buffer.batches[0]['mem']
+
+        with torch.no_grad():
+            for b in self.aux_buffer.batches:
+
+                # Step actor
+                act, val, new_mem = self.model.fwd_recollector(b['act'], b['obs'], mem)
+
+                # Update batch
+                b['act'] = act
+                b['val'] = val
+                b['mem'] = mem
+
+                # Reset memory if any terminal states are reached
+                mem = new_mem
+
+                if torch.any(b['rst']):
+                    mem = self.model.reset_mem(mem, b['rst'], b['nrst'])
+
+            # Perform an additional critic pass to get the final values used in GAE
+            values, _ = self.model.fwd_critic(final_obs, mem)
+
+        # Update target returns
+        self.aux_buffer.label(values, self.discount_factor, self.gae_lambda, skip_std=True)
 
     def update_main(self, iter_num: int) -> 'tuple[Tensor, ...]':
         """
@@ -348,7 +395,13 @@ class PPG:
             self.scheduler.step()
 
         # Update print-out info
-        self.score = self.stats.get('env_score', self.reward).item() / (self.n_rollout_steps * iter_num)
+        score = self.stats.get('Env/score')
+
+        if score is None:
+            self.score = self.reward.item() / self.n_rollout_steps
+
+        else:
+            self.score = score.item() / (self.n_rollout_steps * iter_num)
 
         return tuple([m.detach() for m in mem])
 
@@ -395,16 +448,16 @@ class PPG:
                 reward = batch['rew'].mean()
                 self.reward += reward
 
-                stats['col_act_mean'] += act.loc.mean()
-                stats['col_act_std'] += act.scale.mean()
-                stats['col_val_mean'] += batch['val'].mean()
-                stats['main_loss'] += full_loss
-                stats['main_policy'] += policy_loss
-                stats['main_value'] += value_loss
-                stats['main_entropy'] += entropy
-                stats['main_ratio_diff'] += (ratio - 1.).abs().mean()
-                stats['env_reward'] += reward
-                stats['env_resets'] += batch['rst'].sum()
+                stats['Out/act_mean'] += act.loc.mean()
+                stats['Out/act_std'] += act.scale.mean()
+                stats['Out/val_mean'] += batch['val'].mean()
+                stats['Main/loss'] += full_loss
+                stats['Main/policy'] += policy_loss
+                stats['Main/value'] += value_loss
+                stats['Main/entropy'] += entropy
+                stats['Main/ratio_diff'] += (ratio - 1.).abs().mean()
+                stats['Env/reward'] += reward
+                stats['Env/resets'] += batch['rst'].sum()
 
         # Average loss over N time steps for TBPTT
         # NOTE: https://r2rt.com/styles-of-truncated-backpropagation.html
@@ -516,7 +569,7 @@ class PPG:
             self.scheduler.step()
 
         # Update print-out info
-        self.score = self.stats.get('env_score', self.reward).item() / (self.n_rollout_steps * self.n_main_iters)
+        self.score = self.stats.get('Env/score', self.reward).item() / (self.n_rollout_steps * self.n_main_iters)
 
         return tuple([m.detach() for m in mem])
 
@@ -549,9 +602,9 @@ class PPG:
                 reward = batch['rew'].mean()
                 self.reward += reward
 
-                stats['aux_loss'] += full_loss
-                stats['aux_value'] += value_loss
-                stats['aux_kl_div'] += kl_div
+                stats['Aux/loss'] += full_loss
+                stats['Aux/value'] += value_loss
+                stats['Aux/kl_div'] += kl_div
 
         # Average loss over N time steps for TBPTT
         # NOTE: https://r2rt.com/styles-of-truncated-backpropagation.html

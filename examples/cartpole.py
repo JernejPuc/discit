@@ -226,7 +226,7 @@ class CartpoleModel(ACT):
         return memp, memv
 
     def get_distr(self, args: 'tuple[Tensor, ...]') -> IndepNormal:
-        return IndepNormal(*args, pseudo=False)
+        return IndepNormal(*args, pseudo=False, tanh_arg=None, scale_min=0., scale_bias=0.)
 
     def fwd_partial(
         self,
@@ -249,6 +249,16 @@ class CartpoleModel(ACT):
 
         return x, val_mean, memp, memv
 
+    def fwd_partial_copied(
+        self,
+        obs_vec: Tensor,
+        obs_aux: Tensor,
+        memp: Tensor,
+        memv: Tensor
+    ) -> 'tuple[Tensor, ...]':
+
+        return self.fwd_partial(obs_vec, obs_aux, memp, memv)
+
     def fwd_actor(*args):
         raise NotImplementedError
 
@@ -270,10 +280,24 @@ class CartpoleModel(ACT):
 
         x, val_mean, memp, memv = self.fwd_partial(*obs, *mem)
 
-        act = IndepNormal(x[:, :1], x[:, 1:], pseudo=True)
+        act = IndepNormal(x[:, :1], x[:, 1:], pseudo=True, tanh_arg=None, scale_min=0., scale_bias=0.)
         act_args = (act.loc, act.scale, act.sample())
 
         return act_args, val_mean, (obs[0].clone(), obs[1].clone()), (memp, memv)
+
+    def fwd_recollector(
+        self,
+        act: 'tuple[Tensor, ...]',
+        obs: 'tuple[Tensor, ...]',
+        mem: 'tuple[Tensor, ...]'
+    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
+
+        x, val_mean, memp, memv = self.fwd_partial_copied(*obs, *mem)
+
+        act = IndepNormal(x[:, :1], x[:, 1:], act[-1], pseudo=True, tanh_arg=None, scale_min=0., scale_bias=0.)
+        act_args = (act.loc, act.scale, act.sample)
+
+        return act_args, val_mean, (memp, memv)
 
     def fwd_learner(
         self,
@@ -289,7 +313,7 @@ class CartpoleModel(ACT):
         memv = self.rnnv(v, mem[1])
         v = self.fcv(memv)
 
-        act = IndepNormal(x[:, :1], x[:, 1:], pseudo=True)
+        act = IndepNormal(x[:, :1], x[:, 1:], pseudo=True, tanh_arg=None, scale_min=0., scale_bias=0.)
         val = OnlyMean(symexp(v))
 
         return act, val, (memp, memv)
@@ -314,7 +338,7 @@ if __name__ == '__main__':
 
     # Init model
     model = CartpoleModel()
-    optimiser = NAdamW(model.parameters(), lr=2e-5, weight_decay=0.)
+    optimiser = NAdamW(model.parameters(), lr=2e-5, weight_decay=0., clip_grad_value=None)
 
     scheduler = SoftConstLRScheduler(
         optimiser,
@@ -334,11 +358,17 @@ if __name__ == '__main__':
         env.partial_step, env_step_graph = capture_graph(env.partial_step, inputs, copy_idcs_out=(2, 3))
         env.reset()
 
-        # Accelerate collector and critic
+        # Accelerate collector, recollector, and critic
         mem = model.init_mem(n_envs, detach=True)
         inputs = (*env_step_graph['out'][:2], *mem)
 
+        fwd_partial_copied = model.fwd_partial
         model.fwd_partial, fwd_partial_graph = capture_graph(model.fwd_partial, inputs, copy_idcs_in=(2, 3))
+
+        mem = model.init_mem(n_envs, detach=True)
+        inputs = (*[torch.rand_like(o) for o in env_step_graph['out'][:2]], *mem)
+
+        model.fwd_partial_copied, fwd_partial_copied_graph = capture_graph(fwd_partial_copied, inputs)
 
     rl_algo = PPG(
         env.step,
@@ -355,7 +385,8 @@ if __name__ == '__main__':
         n_aux_iters=n_aux_iters,
         discount_factor=0.98,
         entropy_weight=0.,
-        accelerate=accelerate)
+        accelerate=accelerate,
+        update_returns=False)
 
     try:
         rl_algo.run()
@@ -363,3 +394,5 @@ if __name__ == '__main__':
 
     except KeyboardInterrupt:
         print('\nProcess aborted due to user command.')
+
+    rl_algo.writer.close()

@@ -49,16 +49,19 @@ class IndepNormal(ActionDistrTemplate):
 
         # Shadow cached properties
         if not pseudo:
-            self.mode = self.mean = self.loc = loc
             self.scale = scale
             self.pseudo_scale = None
 
         else:
-            self.mode = self.mean = self.loc = (loc / tanh_arg).tanh() * tanh_arg
+            if tanh_arg:
+                loc = (loc / tanh_arg).tanh() * tanh_arg
+
             self.pseudo_scale = scale
 
         if sample is not None:
             self.sample = sample
+
+        self.mode = self.mean = self.loc = loc
 
     @cached_property
     def log_scale(self) -> Tensor:
@@ -126,16 +129,18 @@ class ClipIndepNormal(ActionDistrTemplate):
 
         # Shadow cached properties
         if not pseudo:
-            self.mode = self.mean = self.loc = loc
             self.scale = scale
             self.pseudo_scale = None
 
         else:
-            self.mode = self.mean = self.loc = (loc / tanh_arg).tanh() * tanh_arg
+            if tanh_arg:
+                loc = (loc / tanh_arg).tanh() * tanh_arg
             self.pseudo_scale = scale
 
         if sample is not None:
             self.sample = sample
+
+        self.mode = self.mean = self.loc = loc
 
     @cached_property
     def log_scale(self) -> Tensor:

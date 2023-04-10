@@ -459,7 +459,7 @@ class ExperienceBuffer:
 
         return ExperienceBuffer(buffer_len, data=(batches, buffer_len))
 
-    def label(self, values: Tensor, gamma: float, lam: float) -> 'tuple[float, float]':
+    def label(self, values: Tensor, gamma: float, lam: float, skip_std: bool = False) -> 'None | tuple[float, float]':
         """
         Compute advantages and returns via generalised advantage estimation (GAE)
         in a traceable way and add them to existing batches.
@@ -479,6 +479,9 @@ class ExperienceBuffer:
 
             batch['adv'] = advantages
             batch['ret'] = advantages + values
+
+        if skip_std:
+            return
 
         advantages = torch.stack([batch['adv'] for batch in self.batches], dim=1)
 
