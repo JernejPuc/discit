@@ -115,7 +115,20 @@ class NAdamW(Optimizer):
                 param.addcdiv_(exp_avg * momentum_step, denom)                  # value
 
 
-class SoftConstLRScheduler:
+class LRSchedulerBase:
+    step_ctr: int
+
+    def __init__(self, starting_step: int = 0):
+        self.step_ctr = starting_step
+
+    def reset(self, starting_step: int = 0):
+        self.step_ctr = starting_step
+
+    def step(self, value: float = None, increment: int = 1):
+        self.step_ctr += increment
+
+
+class SoftConstLRScheduler(LRSchedulerBase):
     """
     Adds cosine warmup and cooldown to a constant learning rate schedule,
     resembling a one-cycle scheduler with extended middle elevation (plateau)
@@ -125,7 +138,6 @@ class SoftConstLRScheduler:
     and final phase.
     """
 
-    step_ctr: int
     in_main: bool
 
     def __init__(
@@ -163,7 +175,7 @@ class SoftConstLRScheduler:
 
         return end + (start - end) / 2. * (cos(torch.pi * phase_ratio) + 1.)
 
-    def step(self, increment: int = 1):
+    def step(self, _value: float = None, increment: int = 1):
         # Keep constant in main phase
         if self.in_main:
             if self.step_ctr < self.step_end_main:
@@ -198,3 +210,69 @@ class SoftConstLRScheduler:
         # Update
         self.update_params(lr, beta1, beta1_next)
         self.step_ctr += increment
+
+
+class AdaptiveLRScheduler(LRSchedulerBase):
+    """
+    Increases or decreases the learning rate based on where the tracked value
+    average falls between given extremes and in regard to the reference value.
+    """
+
+    lr: float
+    window: 'list[float]'
+    window_ptr: int
+
+    def __init__(
+        self,
+        optimiser: Optimizer,
+        starting_step: int = 0,
+        lr_milestones: 'tuple[float, float, float]' = (1e-4, 5e-4, 1e-6),
+        val_milestones: 'tuple[float, float, float]' = (0.1, 0.2, 0.05),
+        scale_factors: 'tuple[float, float]' = (0.5, 1.2),
+        window_len: int = 16
+    ):
+        self.optimiser = optimiser
+
+        self.lr_init, self.lr_max, self.lr_min = lr_milestones
+        self.val_target, self.val_max, self.val_min = val_milestones
+        self.down_scale, self.up_scale = scale_factors
+        self.window_len = window_len
+
+        self.reset(starting_step)
+
+    def reset(self, starting_step: int = 0):
+        self.step_ctr = starting_step
+        self.reset_window(self.lr_init)
+
+    def reset_window(self, lr: float):
+        self.lr = lr
+        self.window = [self.val_target] * self.window_len
+        self.window_ptr = -1
+
+    def update_params(self):
+        with torch.no_grad():
+            for param_group in self.optimiser.param_groups:
+                param_group['lr'].fill_(self.lr)
+
+    def step(self, value: float = None, increment: int = 1):
+        self.step_ctr += increment
+
+        if value is None:
+            return
+
+        self.window_ptr = (self.window_ptr + 1) % self.window_len
+        self.window[self.window_ptr] = value
+
+        val_avg = sum(self.window) / self.window_len
+
+        if self.val_min < val_avg < self.val_max:
+            return
+
+        if val_avg > self.val_max:
+            lr = max(self.lr_min, self.lr * self.down_scale)
+
+        else:
+            lr = min(self.lr_max, self.lr * self.up_scale)
+
+        self.reset_window(lr)
+        self.update_params()

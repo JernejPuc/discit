@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .accel import capture_graph
 from .data import ExperienceBuffer, TensorDict
 from .distr import ActionDistrTemplate, ValueDistrTemplate
-from .optim import SoftConstLRScheduler
+from .optim import LRSchedulerBase
 from .track import CheckpointTracker
 
 
@@ -99,7 +99,7 @@ class PPG:
             ['Tensor | None'],
             'tuple[tuple[Tensor, ...], Tensor, Tensor, dict[str, Any]]'],
         ckpt_tracker: CheckpointTracker,
-        scheduler: SoftConstLRScheduler,
+        scheduler: LRSchedulerBase,
         n_epochs: int,
         log_epoch_interval: int = 1,
         ckpt_epoch_interval: int = 3,
@@ -159,6 +159,7 @@ class PPG:
 
         self.score = 0.
         self.reward = torch.tensor(0., device=self.ckpter.device)
+        self.ratio_diff = torch.tensor(0., device=self.ckpter.device)
         new_zero_tensor = self.reward.clone
 
         self.stats = {
@@ -365,6 +366,7 @@ class PPG:
         mem = None
 
         for batches in self.main_buffer.iter_slices(self.n_truncated_steps):
+            self.ratio_diff.zero_()
 
             # Standard truncation
             if mem is None or not self.replay_rollout:
@@ -392,7 +394,7 @@ class PPG:
                 self.optimiser.zero_grad()
                 mem = self.update_main_single(batches, mem)
 
-            self.scheduler.step()
+            self.scheduler.step(self.ratio_diff.item() / self.n_truncated_steps)
 
         # Update print-out info
         score = self.stats.get('Env/score')
@@ -446,7 +448,10 @@ class PPG:
             # Stats for logging
             with torch.no_grad():
                 reward = batch['rew'].mean()
+                ratio_diff = (ratio - 1.).abs().mean()
+
                 self.reward += reward
+                self.ratio_diff += ratio_diff
 
                 stats['Out/act_mean'] += act.loc.mean()
                 stats['Out/act_std'] += act.scale.mean()
@@ -455,7 +460,7 @@ class PPG:
                 stats['Main/policy'] += policy_loss
                 stats['Main/value'] += value_loss
                 stats['Main/entropy'] += entropy
-                stats['Main/ratio_diff'] += (ratio - 1.).abs().mean()
+                stats['Main/ratio_diff'] += ratio_diff
                 stats['Env/reward'] += reward
                 stats['Env/resets'] += batch['rst'].sum()
 
