@@ -1,6 +1,6 @@
 """NN optimisation"""
 
-from math import cos
+from math import cos, pi
 
 import torch
 from torch import Tensor
@@ -53,14 +53,14 @@ class NAdamW(Optimizer):
         for group in self.param_groups:
 
             # Unpack
-            lr = group['lr']
+            neg_lr = -group['lr']
             beta1 = group['beta1']
             beta1_next = group['beta1_next']
             beta2 = group['beta2']
             beta1_product = group['beta1_product']
             beta2_product = group['beta2_product']
             eps = group['eps']
-            weight_mul = (1. - lr * group['weight_decay']) if group['weight_decay'] is not None else None
+            weight_mul = (1. + neg_lr * group['weight_decay']) if group['weight_decay'] is not None else None
             clip_grad_value = group['clip_grad_value'] if group['clip_grad_value'] is not None else None
 
             # Update
@@ -76,16 +76,13 @@ class NAdamW(Optimizer):
             bias_correction1 = 1. - beta1_product
             bias_correction1_next = 1. - beta1_product_next
 
-            grad_step = -lr * one_minus_beta1 / bias_correction1
-            momentum_step = -lr * beta1_next / bias_correction1_next
+            grad_step = neg_lr * one_minus_beta1 / bias_correction1
+            momentum_step = neg_lr * beta1_next / bias_correction1_next
 
             # Apply per param with valid grad
             for p in group['params']:
                 if p.grad is None:
                     continue
-
-                elif p.grad.is_sparse:
-                    raise RuntimeError('Sparse gradients are not supported.')
 
                 # Unpack EWMA of gradients and squared gradients
                 state: 'dict[str, Tensor]' = self.state[p]
@@ -115,53 +112,63 @@ class NAdamW(Optimizer):
                 param.addcdiv_(exp_avg * momentum_step, denom)                  # value
 
 
-class LRSchedulerBase:
+class LRScheduler:
     step_ctr: int
 
-    def __init__(self, starting_step: int = 0):
-        self.step_ctr = starting_step
+    def __init__(self, optimiser: Optimizer, lr: float, starting_step: int = 0):
+        self.optimiser = optimiser
+        self.lr = lr
+        self.reset(starting_step)
 
     def reset(self, starting_step: int = 0):
         self.step_ctr = starting_step
 
-    def step(self, value: float = None, increment: int = 1):
+    def step(self, _value: float = None, increment: int = 1):
         self.step_ctr += increment
 
 
-class SoftConstLRScheduler(LRSchedulerBase):
-    """
-    Adds cosine warmup and cooldown to a constant learning rate schedule,
-    resembling a one-cycle scheduler with extended middle elevation (plateau)
-    to prolong learning at the maximum rate.
+class ConstScheduler(LRScheduler):
+    """Constant learning rate scheduler that only increments the step counter."""
 
-    NOTE: Milestones refer to lr, beta1, and duration of the starting, main,
-    and final phase.
-    """
 
-    in_main: bool
+class AnnealingScheduler(LRScheduler):
+    """Linear or cosine decaying learning rate scheduler."""
 
     def __init__(
         self,
         optimiser: Optimizer,
-        step_milestones: 'tuple[int, int, int]',
-        starting_step: int = 0,
-        lr_milestones: 'tuple[float, float, float]' = (2e-5, 4e-4, 1e-6),
-        beta1_milestones: 'tuple[float, float, float]' = (0.9, 0.85, 0.98)
+        step_total: int,
+        lr_milestones: 'tuple[float, float]' = (4e-4, 1e-6),
+        beta1_milestones: 'tuple[float, float]' = (0.85, 0.98),
+        cosine: bool = False,
+        starting_step: int = 0
     ):
         self.optimiser = optimiser
 
-        self.lr_init, self.lr_main, self.lr_final = lr_milestones
-        self.beta1_init, self.beta1_main, self.beta1_final = beta1_milestones
-
-        self.step_start_main = step_milestones[0]
-        self.step_end_main = step_milestones[1] + self.step_start_main
-        self.step_total = step_milestones[2] + self.step_end_main
+        self.step_total = step_total
+        self.lr_init, self.lr_final = lr_milestones
+        self.beta1_init, self.beta1_final = beta1_milestones
+        self.cosine = cosine
 
         self.reset(starting_step)
 
     def reset(self, starting_step: int = 0):
         self.step_ctr = starting_step
-        self.in_main = False
+        self.anneal()
+
+    def step(self, _value: float = None, increment: int = 1):
+        self.step_ctr += increment
+        self.update_params(*self.anneal())
+
+    def anneal(self) -> 'tuple[float, float, float]':
+        ratio = self.get_ratio(self.step_ctr, self.step_total)
+        ratio_next = self.get_ratio(self.step_ctr + 1, self.step_total)
+
+        self.lr = self.lerp(self.lr_init, self.lr_final, ratio)
+        beta1 = self.lerp(self.beta1_init, self.beta1_final, ratio)
+        beta1_next = self.lerp(self.beta1_init, self.beta1_final, ratio_next)
+
+        return self.lr, beta1, beta1_next
 
     def update_params(self, lr: float, beta1: float, beta1_next: float):
         with torch.no_grad():
@@ -170,66 +177,150 @@ class SoftConstLRScheduler(LRSchedulerBase):
                 param_group['beta1'].fill_(beta1)
                 param_group['beta1_next'].fill_(beta1_next)
 
-    def anneal(self, start: float, end: float, phase_ratio: float) -> float:
-        """Cosine anneal from start to end as phase_ratio goes from 0 to 1."""
+    def get_ratio(self, num: int, den: int) -> float:
+        ratio = max(0., min(1., num / den))
 
-        return end + (start - end) / 2. * (cos(torch.pi * phase_ratio) + 1.)
+        if self.cosine:
+            ratio = (1. - cos(pi * ratio)) / 2.
+
+        return ratio
+
+    @staticmethod
+    def lerp(start: float, end: float, ratio: float) -> float:
+        return start + (end - start) * ratio
+
+
+class OneCycleScheduler(AnnealingScheduler):
+    """Two-phase annealing learning rate scheduler, with warmup and cooldown."""
+
+    def __init__(
+        self,
+        optimiser: Optimizer,
+        step_milestones: 'tuple[int, int]',
+        lr_milestones: 'tuple[float, float, float]' = (2e-5, 4e-4, 1e-6),
+        beta1_milestones: 'tuple[float, float, float]' = (0.9, 0.85, 0.98),
+        cosine: bool = True,
+        starting_step: int = 0
+    ):
+        self.optimiser = optimiser
+
+        self.step_at_peak, self.step_total = step_milestones
+        self.lr_init, self.lr_max, self.lr_final = lr_milestones
+        self.beta1_init, self.beta1_min, self.beta1_final = beta1_milestones
+        self.cosine = cosine
+
+        self.reset(starting_step)
+
+    def anneal(self) -> 'tuple[float, float, float]':
+        if self.step_ctr < self.step_at_peak:
+            ratio = self.get_ratio(self.step_ctr, self.step_at_peak)
+            ratio_next = self.get_ratio(self.step_ctr + 1, self.step_at_peak)
+
+            self.lr = self.lerp(self.lr_init, self.lr_max, ratio)
+            beta1 = self.lerp(self.beta1_init, self.beta1_min, ratio)
+            beta1_next = self.lerp(self.beta1_init, self.beta1_min, ratio_next)
+
+        else:
+            ratio = self.get_ratio(self.step_ctr, self.step_total)
+            ratio_next = self.get_ratio(self.step_ctr + 1, self.step_total)
+
+            self.lr = self.lerp(self.lr_max, self.lr_final, ratio)
+            beta1 = self.lerp(self.beta1_min, self.beta1_final, ratio)
+            beta1_next = self.lerp(self.beta1_min, self.beta1_final, ratio_next)
+
+        return self.lr, beta1, beta1_next
+
+
+class PlateauScheduler(AnnealingScheduler):
+    """
+    Tri-phase learning rate scheduler, separating warmup and cooldown with an
+    extended middle elevation (plateau) to prolong learning at the maximum rate.
+    """
+
+    in_main: bool
+
+    def __init__(
+        self,
+        optimiser: Optimizer,
+        step_milestones: 'tuple[int, int, int]',
+        lr_milestones: 'tuple[float, float, float]' = (2e-5, 4e-4, 1e-6),
+        beta1_milestones: 'tuple[float, float, float]' = (0.9, 0.85, 0.98),
+        cosine: bool = True,
+        starting_step: int = 0
+    ):
+        self.optimiser = optimiser
+
+        self.step_start_main, self.step_end_main, self.step_total = step_milestones
+        self.lr_init, self.lr_max, self.lr_final = lr_milestones
+        self.beta1_init, self.beta1_min, self.beta1_final = beta1_milestones
+        self.cosine = cosine
+
+        self.reset(starting_step)
+
+    def reset(self, starting_step: int = 0):
+        self.step_ctr = starting_step
+        self.in_main = False
+        self.anneal()
 
     def step(self, _value: float = None, increment: int = 1):
+        self.step_ctr += increment
+
         # Keep constant in main phase
         if self.in_main:
             if self.step_ctr < self.step_end_main:
-                self.step_ctr += increment
                 return
 
-            else:
-                self.in_main = False
+            self.in_main = False
 
-        # Get annealed lr and momentum
+        self.update_params(*self.anneal())
+
+    def anneal(self) -> 'tuple[float, float, float]':
         if self.step_ctr < self.step_start_main:
-            phase_ratio = max(0., min(1., self.step_ctr / self.step_start_main))
-            next_ratio = max(0., min(1., (self.step_ctr+1) / self.step_start_main))
+            ratio = self.get_ratio(self.step_ctr, self.step_start_main)
+            ratio_next = self.get_ratio(self.step_ctr + 1, self.step_start_main)
 
-            lr = self.anneal(self.lr_init, self.lr_main, phase_ratio)
-            beta1 = self.anneal(self.beta1_init, self.beta1_main, phase_ratio)
-            beta1_next = self.anneal(self.beta1_init, self.beta1_main, next_ratio)
+            self.lr = self.lerp(self.lr_init, self.lr_max, ratio)
+            beta1 = self.lerp(self.beta1_init, self.beta1_min, ratio)
+            beta1_next = self.lerp(self.beta1_init, self.beta1_min, ratio_next)
 
         elif self.step_ctr >= self.step_end_main:
-            phase_ratio = max(0., min(1., (self.step_ctr-self.step_end_main) / (self.step_total-self.step_end_main)))
-            next_ratio = max(0., min(1., (self.step_ctr+1-self.step_end_main) / (self.step_total-self.step_end_main)))
-            lr = self.anneal(self.lr_main, self.lr_final, phase_ratio)
-            beta1 = self.anneal(self.beta1_main, self.beta1_final, phase_ratio)
-            beta1_next = self.anneal(self.beta1_main, self.beta1_final, next_ratio)
+            shifted_ctr = self.step_ctr - self.step_end_main
+            shifted_total = self.step_total - self.step_end_main
+
+            ratio = self.get_ratio(shifted_ctr, shifted_total)
+            ratio_next = self.get_ratio(shifted_ctr + 1, shifted_total)
+
+            self.lr = self.lerp(self.lr_max, self.lr_final, ratio)
+            beta1 = self.lerp(self.beta1_min, self.beta1_final, ratio)
+            beta1_next = self.lerp(self.beta1_min, self.beta1_final, ratio_next)
 
         else:
             self.in_main = True
-            lr = self.lr_main
-            beta1 = self.beta1_main
-            beta1_next = self.beta1_main
 
-        # Update
-        self.update_params(lr, beta1, beta1_next)
-        self.step_ctr += increment
+            self.lr = self.lr_max
+            beta1 = self.beta1_min
+            beta1_next = self.beta1_min
+
+        return self.lr, beta1, beta1_next
 
 
-class AdaptiveLRScheduler(LRSchedulerBase):
+class AdaptiveScheduler(LRScheduler):
     """
     Increases or decreases the learning rate based on where the tracked value
     average falls between given extremes and in regard to the reference value.
     """
 
-    lr: float
     window: 'list[float]'
     window_ptr: int
 
     def __init__(
         self,
         optimiser: Optimizer,
-        starting_step: int = 0,
         lr_milestones: 'tuple[float, float, float]' = (1e-4, 5e-4, 1e-6),
         val_milestones: 'tuple[float, float, float]' = (0.1, 0.2, 0.05),
         scale_factors: 'tuple[float, float]' = (0.5, 1.2),
-        window_len: int = 16
+        window_len: int = 16,
+        starting_step: int = 0
     ):
         self.optimiser = optimiser
 
@@ -242,17 +333,12 @@ class AdaptiveLRScheduler(LRSchedulerBase):
 
     def reset(self, starting_step: int = 0):
         self.step_ctr = starting_step
-        self.reset_window(self.lr_init)
+        self.lr = self.lr_init
+        self.reset_window()
 
-    def reset_window(self, lr: float):
-        self.lr = lr
+    def reset_window(self):
         self.window = [self.val_target] * self.window_len
         self.window_ptr = -1
-
-    def update_params(self):
-        with torch.no_grad():
-            for param_group in self.optimiser.param_groups:
-                param_group['lr'].fill_(self.lr)
 
     def step(self, value: float = None, increment: int = 1):
         self.step_ctr += increment
@@ -269,10 +355,122 @@ class AdaptiveLRScheduler(LRSchedulerBase):
             return
 
         if val_avg > self.val_max:
-            lr = max(self.lr_min, self.lr * self.down_scale)
+            self.lr = max(self.lr_min, self.lr * self.down_scale)
 
         else:
-            lr = min(self.lr_max, self.lr * self.up_scale)
+            self.lr = min(self.lr_max, self.lr * self.up_scale)
 
-        self.reset_window(lr)
+        self.reset_window()
         self.update_params()
+
+    def update_params(self):
+        with torch.no_grad():
+            for param_group in self.optimiser.param_groups:
+                param_group['lr'].fill_(self.lr)
+
+
+class AdaptivePlateauScheduler(AnnealingScheduler):
+    """
+    Applies warmup, constance, and cooldown phases to the bounds of the
+    adaptive learning rate scheduler.
+    """
+
+    def __init__(
+        self,
+        optimiser: Optimizer,
+        step_milestones: 'tuple[int, int, int]',
+        lr_milestones: 'tuple[float, float, float]' = (1e-4, 5e-4, 1e-6),
+        beta1_milestones: 'tuple[float, float, float]' = (0.9, 0.85, 0.98),
+        high_milestones: 'tuple[float, float, float]' = (0.05, 0.2, 0.01),
+        low_milestones: 'tuple[float, float, float]' = (0.01, 0.05, 0.),
+        scale_factors: 'tuple[float, float]' = (0.7, 1.2),
+        cosine: bool = True,
+        window_len: int = 16,
+        starting_step: int = 0
+    ):
+        self.optimiser = optimiser
+
+        self.step_start_main, self.step_end_main, self.step_total = step_milestones
+        self.lr_init, self.lr_max, self.lr_min = lr_milestones
+        self.beta1_init, self.beta1_min, self.beta1_final = beta1_milestones
+        self.high_init, self.high_max, self.high_final = high_milestones
+        self.low_init, self.low_max, self.low_final = low_milestones
+        self.down_scale, self.up_scale = scale_factors
+        self.cosine = cosine
+        self.window_len = window_len
+
+        self.reset(starting_step)
+
+    def reset(self, starting_step: int = 0):
+        self.step_ctr = starting_step
+        self.in_main = False
+        self.lr = self.lr_init
+        self.anneal()
+        self.reset_window()
+
+    def reset_window(self):
+        self.window = [self.val_target] * self.window_len
+        self.window_ptr = -1
+
+    def step(self, value: float = None, increment: int = 1):
+        self.step_ctr += increment
+
+        if value is not None:
+            self.window_ptr = (self.window_ptr + 1) % self.window_len
+            self.window[self.window_ptr] = value
+
+        val_avg = sum(self.window) / self.window_len
+        val_min, val_max, beta1, beta1_next = self.anneal()
+
+        if val_avg > val_max:
+            self.lr = max(self.lr_min, self.lr * self.down_scale)
+            self.reset_window()
+
+        elif val_avg < val_min:
+            self.lr = min(self.lr_max, self.lr * self.up_scale)
+            self.reset_window()
+
+        elif self.in_main:
+            if self.step_ctr < self.step_end_main:
+                return
+
+            self.in_main = False
+
+        self.update_params(self.lr, beta1, beta1_next)
+
+    def anneal(self) -> 'tuple[float, ...]':
+        if self.step_ctr < self.step_start_main:
+            ratio = self.get_ratio(self.step_ctr, self.step_start_main)
+            ratio_next = self.get_ratio(self.step_ctr + 1, self.step_start_main)
+
+            val_min = self.lerp(self.low_init, self.low_max, ratio)
+            val_max = self.lerp(self.high_init, self.high_max, ratio)
+
+            beta1 = self.lerp(self.beta1_init, self.beta1_min, ratio)
+            beta1_next = self.lerp(self.beta1_init, self.beta1_min, ratio_next)
+
+        elif self.step_ctr >= self.step_end_main:
+            shifted_ctr = self.step_ctr - self.step_end_main
+            shifted_total = self.step_total - self.step_end_main
+
+            ratio = self.get_ratio(shifted_ctr, shifted_total)
+            ratio_next = self.get_ratio(shifted_ctr + 1, shifted_total)
+
+            val_min = self.lerp(self.low_max, self.low_final, ratio)
+            val_max = self.lerp(self.high_max, self.high_final, ratio)
+
+            beta1 = self.lerp(self.beta1_min, self.beta1_final, ratio)
+            beta1_next = self.lerp(self.beta1_min, self.beta1_final, ratio_next)
+
+        else:
+            self.in_main = True
+
+            val_min = self.low_max
+            val_max = self.high_max
+
+            beta1 = self.beta1_min
+            beta1_next = self.beta1_min
+
+        self.val_target = (val_min + val_max) / 2.
+
+        return val_min, val_max, beta1, beta1_next

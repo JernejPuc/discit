@@ -2,10 +2,10 @@ import torch
 from torch import nn, Tensor
 
 from discit.accel import capture_graph
-from discit.distr import IndepNormal, OnlyMean
+from discit.distr import MultiNormal, FixedVarNormal
 from discit.func import symexp
-from discit.optim import NAdamW, SoftConstLRScheduler
-from discit.rl import ActorCriticTemplate as ACT, PPG
+from discit.optim import NAdamW, AdaptivePlateauScheduler
+from discit.rl import ActorCritic, PPG
 from discit.track import CheckpointTracker
 
 
@@ -155,7 +155,7 @@ class CartpoleEnv:
 
 
 # Overkill for cartpole, but the point is to test the components, not just solve cartpole
-class CartpoleModel(ACT):
+class CartpoleModel(ActorCritic):
     def __init__(
         self,
         n_in_vec: int = 5,      # pos., vel., ang. cos., ang. sin., ang. vel.
@@ -213,20 +213,19 @@ class CartpoleModel(ACT):
     def reset_mem(
         self,
         mem: 'tuple[Tensor]',
-        reset_mask: Tensor,
-        keep_mask: Tensor = None
+        reset_mask: Tensor
     ) -> 'tuple[Tensor]':
 
         reset_mask = reset_mask[..., None]
-        keep_mask = (1. - reset_mask) if keep_mask is None else keep_mask[..., None]
+        memp, memv = mem
 
-        memp = keep_mask * mem[0] + reset_mask * self.memp
-        memv = keep_mask * mem[1] + reset_mask * self.memv
+        memp = torch.lerp(memp, self.memp, reset_mask)
+        memv = torch.lerp(memv, self.memv, reset_mask)
 
         return memp, memv
 
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> IndepNormal:
-        return IndepNormal(*args, pseudo=False, tanh_arg=None, scale_min=0., scale_bias=0.)
+    def get_distr(self, args: 'tuple[Tensor, ...]') -> MultiNormal:
+        return MultiNormal(*args)
 
     def fwd_partial(
         self,
@@ -245,7 +244,7 @@ class CartpoleModel(ACT):
             memv = self.rnnv(v, memv)
             v = self.fcv(memv)
 
-            val_mean = OnlyMean(symexp(v)).mean.flatten()
+            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
 
         return x, val_mean, memp, memv
 
@@ -276,34 +275,31 @@ class CartpoleModel(ACT):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
+    ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
 
         x, val_mean, memp, memv = self.fwd_partial(*obs, *mem)
 
-        act = IndepNormal(x[:, :1], x[:, 1:], pseudo=True, tanh_arg=None, scale_min=0., scale_bias=0.)
-        act_args = (act.loc, act.scale, act.sample())
+        act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
 
-        return act_args, val_mean, (obs[0].clone(), obs[1].clone()), (memp, memv)
+        return act.sample(), (act.mean, act.log_dev), val_mean, (obs[0].clone(), obs[1].clone()), (memp, memv)
 
     def fwd_recollector(
         self,
-        act: 'tuple[Tensor, ...]',
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
     ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
 
         x, val_mean, memp, memv = self.fwd_partial_copied(*obs, *mem)
 
-        act = IndepNormal(x[:, :1], x[:, 1:], act[-1], pseudo=True, tanh_arg=None, scale_min=0., scale_bias=0.)
-        act_args = (act.loc, act.scale, act.sample)
+        act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
 
-        return act_args, val_mean, (memp, memv)
+        return (act.mean, act.log_dev), val_mean, (memp, memv)
 
     def fwd_learner(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[IndepNormal, OnlyMean, tuple[Tensor, ...]]':
+    ) -> 'tuple[MultiNormal, FixedVarNormal, tuple[Tensor, ...]]':
 
         x = self.activ(self.fcin(obs[0]))
         memp = self.rnnp(x, mem[0])
@@ -313,8 +309,8 @@ class CartpoleModel(ACT):
         memv = self.rnnv(v, mem[1])
         v = self.fcv(memv)
 
-        act = IndepNormal(x[:, :1], x[:, 1:], pseudo=True, tanh_arg=None, scale_min=0., scale_bias=0.)
-        val = OnlyMean(symexp(v))
+        act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
+        val = FixedVarNormal(symexp(v))
 
         return act, val, (memp, memv)
 
@@ -340,7 +336,7 @@ if __name__ == '__main__':
     model = CartpoleModel()
     optimiser = NAdamW(model.parameters(), lr=2e-5, weight_decay=0., clip_grad_value=None)
 
-    scheduler = SoftConstLRScheduler(
+    scheduler = AdaptivePlateauScheduler(
         optimiser,
         step_milestones=[ep * n_updates_per_epoch for ep in epoch_milestones],
         starting_step=ckpter.meta['update_step'])

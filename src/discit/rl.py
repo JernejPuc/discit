@@ -14,12 +14,12 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .accel import capture_graph
 from .data import ExperienceBuffer, TensorDict
-from .distr import ActionDistrTemplate, ValueDistrTemplate
-from .optim import LRSchedulerBase
+from .distr import Distribution
+from .optim import LRScheduler
 from .track import CheckpointTracker
 
 
-class ActorCriticTemplate(Module, ABC):
+class ActorCritic(Module, ABC):
     MODE_LEARNER = 0
     MODE_COLLECTOR = 1
     MODE_RECOLLECTOR = 2
@@ -33,15 +33,15 @@ class ActorCriticTemplate(Module, ABC):
 
     @abstractmethod
     def init_mem(self, batch_size: int, detach: bool) -> 'tuple[Tensor, ...]':
-        raise NotImplementedError
+        ...
 
     @abstractmethod
-    def reset_mem(self, mem: 'tuple[Tensor, ...]', reset_mask: Tensor, keep_mask: Tensor) -> 'tuple[Tensor, ...]':
-        raise NotImplementedError
+    def reset_mem(self, mem: 'tuple[Tensor, ...]', reset_mask: Tensor) -> 'tuple[Tensor, ...]':
+        ...
 
     @abstractmethod
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> ActionDistrTemplate:
-        raise NotImplementedError
+    def get_distr(self, args: 'tuple[Tensor, ...]') -> Distribution:
+        ...
 
     @abstractmethod
     def fwd_actor(
@@ -49,7 +49,7 @@ class ActorCriticTemplate(Module, ABC):
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
     ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def fwd_critic(
@@ -57,32 +57,31 @@ class ActorCriticTemplate(Module, ABC):
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
     ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def fwd_collector(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
-        raise NotImplementedError
+    ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
+        ...
 
     @abstractmethod
     def fwd_recollector(
         self,
-        act: 'tuple[Tensor, ...]',
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
     ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     def fwd_learner(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[ActionDistrTemplate, ValueDistrTemplate, tuple[Tensor, ...]]':
-        raise NotImplementedError
+    ) -> 'tuple[Distribution, Distribution, tuple[Tensor, ...]]':
+        ...
 
     def forward(self, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]', mode: int = MODE_LEARNER):
         return self.fwd_map[mode](obs, mem)
@@ -99,7 +98,7 @@ class PPG:
             ['Tensor | None'],
             'tuple[tuple[Tensor, ...], Tensor, Tensor, dict[str, Any]]'],
         ckpt_tracker: CheckpointTracker,
-        scheduler: LRSchedulerBase,
+        scheduler: LRScheduler,
         n_epochs: int,
         log_epoch_interval: int = 1,
         ckpt_epoch_interval: int = 3,
@@ -123,7 +122,7 @@ class PPG:
 
         self.env_step = env_step
         self.ckpter = ckpt_tracker
-        self.model: ActorCriticTemplate = ckpt_tracker.model
+        self.model: ActorCritic = ckpt_tracker.model
         self.optimiser = ckpt_tracker.optimiser
         self.scheduler = scheduler
 
@@ -159,8 +158,10 @@ class PPG:
 
         self.score = 0.
         self.reward = torch.tensor(0., device=self.ckpter.device)
-        self.ratio_diff = torch.tensor(0., device=self.ckpter.device)
         new_zero_tensor = self.reward.clone
+
+        self.lr = 0.
+        self.ratio_diff = new_zero_tensor()
 
         self.stats = {
             'Out/act_mean': new_zero_tensor(),
@@ -255,24 +256,28 @@ class PPG:
             end='')
 
     def log(self, epoch_step: int):
-        den_main = self.n_rollout_steps * self.n_main_iters * self.log_interval
-        den_aux = den_main * max(1, self.n_aux_iters)
-        den_gae = self.n_main_iters * self.log_interval
+        n_main = self.n_rollout_steps * self.n_main_iters * self.log_interval
+        n_aux = n_main * self.n_aux_iters
+        n_gae = self.n_main_iters * self.log_interval
+        n_upd = (n_main + n_aux) // self.n_truncated_steps
 
-        env_step = epoch_step * den_main
+        env_step = epoch_step * n_main
 
         for key, val in self.stats.items():
             if key.startswith('Aux'):
-                den = den_aux
+                den = n_aux
 
             elif key.startswith('GAE'):
-                den = den_gae
+                den = n_gae
 
             else:
-                den = den_main
+                den = n_main
 
             self.write(key, val.item() / den, env_step)
             val.zero_()
+
+        self.write('Opt/lr', self.lr / n_upd, env_step)
+        self.lr = 0.
 
     def checkpoint(self, epoch_step: int, branch: bool = False):
         update_step = self.scheduler.step_ctr
@@ -285,22 +290,22 @@ class PPG:
             for _ in range(self.n_rollout_steps):
 
                 # Step actor
-                act, val, obs_enc, new_mem = self.model.fwd_collector(obs, mem)
-                act_sample = self.model.get_distr(act).sample
+                sample, act, val, obs_enc, new_mem = self.model.fwd_collector(obs, mem)
 
                 # Step env.
-                obs, rew, rst, info = self.env_step(act_sample)
-                nrst = 1. - rst
+                obs, rew, rst, info = self.env_step(sample[0])
+                nonrst = 1. - rst
 
                 # Add batch to buffers
                 d = TensorDict({
+                    'sample': sample,
                     'act': act,
                     'val': val,
                     'obs': obs_enc,
                     'mem': mem,
                     'rew': rew,
                     'rst': rst,
-                    'nrst': nrst})
+                    'nonrst': nonrst})
 
                 self.main_buffer.append(d)
                 self.aux_buffer.append(d)
@@ -309,7 +314,7 @@ class PPG:
                 mem = new_mem
 
                 if torch.any(rst):
-                    mem = self.model.reset_mem(mem, rst, nrst)
+                    mem = self.model.reset_mem(mem, rst)
 
                 # Add env. info. to logged metrics
                 for key, val in info.items():
@@ -337,7 +342,7 @@ class PPG:
             for b in self.aux_buffer.batches:
 
                 # Step actor
-                act, val, new_mem = self.model.fwd_recollector(b['act'], b['obs'], mem)
+                act, val, new_mem = self.model.fwd_recollector(b['obs'], mem)
 
                 # Update batch
                 b['act'] = act
@@ -348,7 +353,7 @@ class PPG:
                 mem = new_mem
 
                 if torch.any(b['rst']):
-                    mem = self.model.reset_mem(mem, b['rst'], b['nrst'])
+                    mem = self.model.reset_mem(mem, b['rst'])
 
             # Perform an additional critic pass to get the final values used in GAE
             values, _ = self.model.fwd_critic(final_obs, mem)
@@ -395,6 +400,7 @@ class PPG:
                 mem = self.update_main_single(batches, mem)
 
             self.scheduler.step(self.ratio_diff.item() / self.n_truncated_steps)
+            self.lr += self.scheduler.lr
 
         # Update print-out info
         score = self.stats.get('Env/score')
@@ -413,17 +419,16 @@ class PPG:
 
         for batch in batches:
             act, val, mem = self.model(batch['obs'], mem)
-            act: ActionDistrTemplate
-            val: ValueDistrTemplate
+            act: Distribution
+            val: Distribution
 
-            mem = self.model.reset_mem(mem, batch['rst'], batch['nrst'])
+            mem = self.model.reset_mem(mem, batch['rst'])
 
             # Policy
-            old_act: ActionDistrTemplate = self.model.get_distr(batch['act'])
-            act_sample = old_act.sample
+            old_act: Distribution = self.model.get_distr(batch['act'])
 
-            act_log_prob = act.log_prob(act_sample)
-            old_act_log_prob = old_act.log_prob(act_sample)
+            act_log_prob = act.log_prob(*batch['sample'])
+            old_act_log_prob = old_act.log_prob(*batch['sample'])
 
             # Bound ratio to [0.05, 20] for stability
             old_act_log_prob = old_act_log_prob.clamp(act_log_prob-3., act_log_prob+3.)
@@ -436,7 +441,7 @@ class PPG:
 
             # Value
             # NOTE: No value loss clipping
-            value_loss = -val.log_prob(batch['ret']).mean()
+            value_loss = -val.log_prob(batch['ret'].unsqueeze(-1)).mean()
 
             # Entropy
             entropy = act.entropy.mean()
@@ -453,8 +458,8 @@ class PPG:
                 self.reward += reward
                 self.ratio_diff += ratio_diff
 
-                stats['Out/act_mean'] += act.loc.mean()
-                stats['Out/act_std'] += act.scale.mean()
+                stats['Out/act_mean'] += act.mean.mean()
+                stats['Out/act_std'] += act.dev.mean()
                 stats['Out/val_mean'] += batch['val'].mean()
                 stats['Main/loss'] += full_loss
                 stats['Main/policy'] += policy_loss
@@ -572,6 +577,7 @@ class PPG:
                 mem = self.update_aux_single(batches, mem)
 
             self.scheduler.step()
+            self.lr += self.scheduler.lr
 
         # Update print-out info
         self.score = self.stats.get('Env/score', self.reward).item() / (self.n_rollout_steps * self.n_main_iters)
@@ -584,19 +590,19 @@ class PPG:
 
         for batch in batches:
             act, val, mem = self.model(batch['obs'], mem)
-            act: ActionDistrTemplate
-            val: ValueDistrTemplate
+            act: Distribution
+            val: Distribution
 
-            mem = self.model.reset_mem(mem, batch['rst'], batch['nrst'])
+            mem = self.model.reset_mem(mem, batch['rst'])
 
             # KL divergence
-            old_act: ActionDistrTemplate = self.model.get_distr(batch['act'])
+            old_act: Distribution = self.model.get_distr(batch['act'])
 
             kl_div = old_act.kl_div(act).mean()
 
             # Value
             # NOTE: No value loss clipping
-            value_loss = -val.log_prob(batch['ret']).mean()
+            value_loss = -val.log_prob(batch['ret'].unsqueeze(-1)).mean()
 
             # Total
             full_loss = value_loss + kl_div

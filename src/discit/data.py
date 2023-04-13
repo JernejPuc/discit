@@ -136,6 +136,7 @@ class TensorDict(dict):
     """Wrapper around a dict with assumptions for key and value content."""
 
     VAL_TYPES = {
+        'sample': 'tuple[Tensor, ...]',
         'act': 'tuple[Tensor, ...]',
         'val': Tensor,
         'obs': 'tuple[Tensor, ...]',
@@ -144,7 +145,7 @@ class TensorDict(dict):
         'ret': Tensor,
         'adv': Tensor,
         'rst': Tensor,
-        'nrst': Tensor}
+        'nonrst': Tensor}
 
     def size(self) -> int:
         try:
@@ -473,8 +474,8 @@ class ExperienceBuffer:
         # NOTE: Final values (future returns) in an episode are assumed to be zeros
         # Earlier returns are based (bootstrapped) on the model's estimates
         for batch in reversed(self.batches):
-            deltas = batch['rew'] + batch['nrst'] * gamma * values - batch['val']
-            advantages = deltas + batch['nrst'] * gamma * lam * advantages
+            deltas = batch['rew'] + batch['nonrst'] * gamma * values - batch['val']
+            advantages = deltas + batch['nonrst'] * gamma * lam * advantages
             values = batch['val']
 
             batch['adv'] = advantages
