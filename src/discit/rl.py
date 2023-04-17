@@ -71,7 +71,8 @@ class ActorCritic(Module, ABC):
     def fwd_recollector(
         self,
         obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
+        mem: 'tuple[Tensor, ...]',
+        get_distr: bool
     ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
         ...
 
@@ -219,7 +220,7 @@ class PPG:
                 self.print_progress(progress, remaining_time, epoch_step, i, False)
 
                 if self.update_returns:
-                    self.recollect(obs)
+                    self.recollect(obs, i == 1)
 
                 mem = self.update_aux()
 
@@ -335,17 +336,19 @@ class PPG:
 
         return obs, mem
 
-    def recollect(self, final_obs: 'tuple[Tensor, ...]'):
+    def recollect(self, final_obs: 'tuple[Tensor, ...]', update_act: bool):
         mem = self.aux_buffer.batches[0]['mem']
 
         with torch.no_grad():
             for b in self.aux_buffer.batches:
 
                 # Step actor
-                act, val, new_mem = self.model.fwd_recollector(b['obs'], mem)
+                act, val, new_mem = self.model.fwd_recollector(b['obs'], mem, update_act)
 
                 # Update batch
-                b['act'] = act
+                if update_act:
+                    b['act'] = act
+
                 b['val'] = val
                 b['mem'] = mem
 

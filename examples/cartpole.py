@@ -141,8 +141,7 @@ class CartpoleEnv:
         corr_mask_lt = new_angle < -torch.pi
         non_corr_mask = ~(corr_mask_gt | corr_mask_lt)
 
-        new_angle = torch.where(corr_mask_gt, new_angle - self._2PI, new_angle)
-        new_angle = torch.where(corr_mask_lt, new_angle + self._2PI, new_angle)
+        new_angle += (corr_mask_lt.float() - corr_mask_gt.float()) * self._2PI
 
         self.was_upright |= (new_angle.sign() != self.angle.sign()) & non_corr_mask
         self.angle.copy_(new_angle)
@@ -286,14 +285,20 @@ class CartpoleModel(ActorCritic):
     def fwd_recollector(
         self,
         obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
+        mem: 'tuple[Tensor, ...]',
+        get_distr: bool = True
     ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
 
         x, val_mean, memp, memv = self.fwd_partial_copied(*obs, *mem)
 
-        act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
+        if get_distr:
+            act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
+            act_args = (act.mean, act.log_dev)
 
-        return (act.mean, act.log_dev), val_mean, (memp, memv)
+        else:
+            act_args = ()
+
+        return act_args, val_mean, (memp, memv)
 
     def fwd_learner(
         self,
@@ -329,7 +334,7 @@ if __name__ == '__main__':
         + n_rollout_steps * n_main_iters // n_truncated_steps * n_aux_iters)
 
     # Init envs.
-    ckpter = CheckpointTracker('cartpole')
+    ckpter = CheckpointTracker('cartpolew')
     env = CartpoleEnv(n_envs, ckpter.device)
 
     # Init model

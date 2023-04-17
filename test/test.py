@@ -25,7 +25,7 @@ class TestDistributions(unittest.TestCase):
         values_2 = torch.tensor([[1.], [0.5]])
 
         # 5x4, 2x1 -> 4x5, 1x2 -> 4x5x1, 1x1x2 -> 4x5x2 -> 4x10 -> 10x4
-        values = (values_1.t().unsqueeze(-1) * values_2.t().unsqueeze(-2)).flatten(-2).t()
+        values = (values_1.T.unsqueeze(-1) * values_2.T.unsqueeze(-2)).flatten(-2).T
         n_cont_vars = 3
 
         # Raw inputs
@@ -80,7 +80,7 @@ class TestDistributions(unittest.TestCase):
         values_2 = torch.tensor([[1.], [0.5]])
 
         # 5x4, 2x1 -> 4x5, 1x2 -> 4x5x1, 1x1x2 -> 4x5x2 -> 4x10 -> 10x4
-        values = (values_1.t().unsqueeze(-1) * values_2.t().unsqueeze(-2)).flatten(-2).t()
+        values = (values_1.T.unsqueeze(-1) * values_2.T.unsqueeze(-2)).flatten(-2).T
 
         # Raw inputs
         logits_1 = torch.from_numpy(rng.random((BATCH_SIZE, len(values_1)), dtype=np.float32))

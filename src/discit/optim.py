@@ -120,6 +120,10 @@ class LRScheduler:
         self.lr = lr
         self.reset(starting_step)
 
+        with torch.no_grad():
+            for param_group in self.optimiser.param_groups:
+                param_group['lr'].fill_(lr)
+
     def reset(self, starting_step: int = 0):
         self.step_ctr = starting_step
 
@@ -127,7 +131,7 @@ class LRScheduler:
         self.step_ctr += increment
 
 
-class ConstScheduler(LRScheduler):
+class ConstantScheduler(LRScheduler):
     """Constant learning rate scheduler that only increments the step counter."""
 
 
@@ -154,7 +158,7 @@ class AnnealingScheduler(LRScheduler):
 
     def reset(self, starting_step: int = 0):
         self.step_ctr = starting_step
-        self.anneal()
+        self.update_params(*self.anneal())
 
     def step(self, _value: float = None, increment: int = 1):
         self.step_ctr += increment
@@ -260,7 +264,7 @@ class PlateauScheduler(AnnealingScheduler):
     def reset(self, starting_step: int = 0):
         self.step_ctr = starting_step
         self.in_main = False
-        self.anneal()
+        self.update_params(*self.anneal())
 
     def step(self, _value: float = None, increment: int = 1):
         self.step_ctr += increment
@@ -334,6 +338,7 @@ class AdaptiveScheduler(LRScheduler):
     def reset(self, starting_step: int = 0):
         self.step_ctr = starting_step
         self.lr = self.lr_init
+        self.update_params()
         self.reset_window()
 
     def reset_window(self):
@@ -405,7 +410,8 @@ class AdaptivePlateauScheduler(AnnealingScheduler):
         self.step_ctr = starting_step
         self.in_main = False
         self.lr = self.lr_init
-        self.anneal()
+        *_, beta1, beta1_next = self.anneal()
+        self.update_params(self.lr, beta1, beta1_next)
         self.reset_window()
 
     def reset_window(self):
