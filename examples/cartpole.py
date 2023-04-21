@@ -109,7 +109,7 @@ class CartpoleEnv:
         if action is None:
             return self.get_observation(), None, None, self.NULL_DICT
 
-        *obs, rew, rst = self.partial_step(action.flatten())
+        *obs, rew, rst = self.step_partial(action.flatten())
         rst_idcs = torch.nonzero(rst, as_tuple=True)[0]
 
         if len(rst_idcs):
@@ -117,7 +117,7 @@ class CartpoleEnv:
 
         return obs, rew, rst, self.NULL_DICT
 
-    def partial_step(self, action: Tensor) -> 'tuple[Tensor, ...]':
+    def step_partial(self, action: Tensor) -> 'tuple[Tensor, ...]':
         force = action * self.FORCE_SCALE
         angle_cos = self.angle.cos()
         angle_sin = self.angle.sin()
@@ -199,13 +199,9 @@ class CartpoleModel(ActorCritic):
             self.rnnp.bias_hh[mem_size:-mem_size].uniform_(1, chrono_len - 1).log_()
             self.rnnv.bias_hh[mem_size:-mem_size].uniform_(1, chrono_len - 1).log_()
 
-    def init_mem(self, batch_size: int = 1, detach: bool = False) -> 'tuple[Tensor]':
-        memp = self.memp.expand(batch_size, -1)
-        memv = self.memv.expand(batch_size, -1)
-
-        if detach:
-            memp = memp.detach().clone()
-            memv = memv.detach().clone()
+    def init_mem(self, batch_size: int = 1) -> 'tuple[Tensor]':
+        memp = self.memp.detach().expand(batch_size, -1).clone()
+        memv = self.memv.detach().expand(batch_size, -1).clone()
 
         return memp, memv
 
@@ -215,7 +211,7 @@ class CartpoleModel(ActorCritic):
         reset_mask: Tensor
     ) -> 'tuple[Tensor]':
 
-        reset_mask = reset_mask[..., None]
+        reset_mask = reset_mask.unsqueeze(-1)
         memp, memv = mem
 
         memp = torch.lerp(memp, self.memp, reset_mask)
@@ -223,10 +219,35 @@ class CartpoleModel(ActorCritic):
 
         return memp, memv
 
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> MultiNormal:
+    def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> MultiNormal:
+        if from_raw:
+            return MultiNormal.from_raw(args[:, :1], args[:, 1:])
+
         return MultiNormal(*args)
 
+    def act(self, *args, **kwargs):
+        raise NotImplementedError
+
     def fwd_partial(
+        self,
+        obs_vec: Tensor,
+        obs_aux: Tensor,
+        memp: Tensor,
+        memv: Tensor,
+        detach: bool = False
+    ) -> 'tuple[Tensor, ...]':
+
+        x = self.activ(self.fcin(obs_vec))
+        memp = self.rnnp(x, memp)
+        x = self.fcout(memp)
+
+        v = torch.cat((memp.detach() if detach else memp, obs_aux), dim=1)
+        memv = self.rnnv(v, memv)
+        v = self.fcv(memv)
+
+        return x, v, memp, memv
+
+    def collect_partial(
         self,
         obs_vec: Tensor,
         obs_aux: Tensor,
@@ -235,84 +256,42 @@ class CartpoleModel(ActorCritic):
     ) -> 'tuple[Tensor, ...]':
 
         with torch.no_grad():
-            x = self.activ(self.fcin(obs_vec))
-            memp = self.rnnp(x, memp)
-            x = self.fcout(memp)
-
-            v = torch.cat((memp, obs_aux), dim=1)
-            memv = self.rnnv(v, memv)
-            v = self.fcv(memv)
+            x, v, memp, memv = self.fwd_partial(obs_vec, obs_aux, memp, memv, detach=False)
 
             val_mean = FixedVarNormal(symexp(v)).mean.flatten()
 
         return x, val_mean, memp, memv
 
-    def fwd_partial_copied(
-        self,
-        obs_vec: Tensor,
-        obs_aux: Tensor,
-        memp: Tensor,
-        memv: Tensor
-    ) -> 'tuple[Tensor, ...]':
+    def collect_static(self, *args):
+        return self.collect_partial(*args)
 
-        return self.fwd_partial(obs_vec, obs_aux, memp, memv)
+    def collect_copied(self, *args):
+        return self.collect_partial(*args)
 
-    def fwd_actor(*args):
-        raise NotImplementedError
-
-    def fwd_critic(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-
-        _, val_mean, memp, memv = self.fwd_partial(*obs, *mem)
-
-        return val_mean, (memp, memv)
-
-    def fwd_collector(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
-
-        x, val_mean, memp, memv = self.fwd_partial(*obs, *mem)
-
-        act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
-
-        return act.sample(), (act.mean, act.log_dev), val_mean, (obs[0].clone(), obs[1].clone()), (memp, memv)
-
-    def fwd_recollector(
+    def collect(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
-        get_distr: bool = True
-    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
+        encode: bool
+    ) -> 'tuple[Tensor, Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
 
-        x, val_mean, memp, memv = self.fwd_partial_copied(*obs, *mem)
-
-        if get_distr:
-            act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
-            act_args = (act.mean, act.log_dev)
+        if encode:
+            x, val_mean, memp, memv = self.collect_static(*obs, *mem)
+            obs = obs[0].clone(), obs[1].clone()
 
         else:
-            act_args = ()
+            x, val_mean, memp, memv = self.collect_copied(*obs, *mem)
 
-        return act_args, val_mean, (memp, memv)
+        return x, val_mean, obs, (memp, memv)
 
-    def fwd_learner(
+    def forward(
         self,
         obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
+        mem: 'tuple[Tensor, ...]',
+        detach: bool = False
     ) -> 'tuple[MultiNormal, FixedVarNormal, tuple[Tensor, ...]]':
 
-        x = self.activ(self.fcin(obs[0]))
-        memp = self.rnnp(x, mem[0])
-        x = self.fcout(memp)
-
-        v = torch.cat((memp, obs[1]), dim=1)
-        memv = self.rnnv(v, mem[1])
-        v = self.fcv(memv)
+        x, v, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
 
         act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
         val = FixedVarNormal(symexp(v))
@@ -334,7 +313,7 @@ if __name__ == '__main__':
         + n_rollout_steps * n_main_iters // n_truncated_steps * n_aux_iters)
 
     # Init envs.
-    ckpter = CheckpointTracker('cartpolew')
+    ckpter = CheckpointTracker('cartpole')
     env = CartpoleEnv(n_envs, ckpter.device)
 
     # Init model
@@ -356,20 +335,19 @@ if __name__ == '__main__':
     if accelerate:
         inputs = torch.zeros(n_envs, dtype=torch.float32, device=ckpter.device),
 
-        env.partial_step, env_step_graph = capture_graph(env.partial_step, inputs, copy_idcs_out=(2, 3))
+        env.step_partial, env_step_graph = capture_graph(env.step_partial, inputs, copy_idcs_out=(2, 3))
         env.reset()
 
         # Accelerate collector, recollector, and critic
-        mem = model.init_mem(n_envs, detach=True)
+        mem = model.init_mem(n_envs)
         inputs = (*env_step_graph['out'][:2], *mem)
 
-        fwd_partial_copied = model.fwd_partial
-        model.fwd_partial, fwd_partial_graph = capture_graph(model.fwd_partial, inputs, copy_idcs_in=(2, 3))
+        model.collect_static, collect_static_graph = capture_graph(model.collect_partial, inputs, copy_idcs_in=(2, 3))
 
-        mem = model.init_mem(n_envs, detach=True)
+        mem = model.init_mem(n_envs)
         inputs = (*[torch.rand_like(o) for o in env_step_graph['out'][:2]], *mem)
 
-        model.fwd_partial_copied, fwd_partial_copied_graph = capture_graph(fwd_partial_copied, inputs)
+        model.collect_copied, collect_copied_graph = capture_graph(model.collect_partial, inputs)
 
     rl_algo = PPG(
         env.step,
@@ -387,7 +365,7 @@ if __name__ == '__main__':
         discount_factor=0.98,
         entropy_weight=0.,
         accelerate=accelerate,
-        update_returns=False)
+        detach_critic=False)
 
     try:
         rl_algo.run()

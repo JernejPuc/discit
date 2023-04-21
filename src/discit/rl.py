@@ -20,19 +20,11 @@ from .track import CheckpointTracker
 
 
 class ActorCritic(Module, ABC):
-    MODE_LEARNER = 0
-    MODE_COLLECTOR = 1
-    MODE_RECOLLECTOR = 2
-    MODE_ACTOR = 3
-    MODE_CRITIC = 4
-
     def __init__(self):
         Module.__init__(self)
 
-        self.fwd_map = (self.fwd_learner, self.fwd_collector, self.fwd_recollector, self.fwd_actor, self.fwd_critic)
-
     @abstractmethod
-    def init_mem(self, batch_size: int, detach: bool) -> 'tuple[Tensor, ...]':
+    def init_mem(self, batch_size: int) -> 'tuple[Tensor, ...]':
         ...
 
     @abstractmethod
@@ -40,52 +32,35 @@ class ActorCritic(Module, ABC):
         ...
 
     @abstractmethod
-    def get_distr(self, args: 'tuple[Tensor, ...]') -> Distribution:
+    def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> Distribution:
         ...
 
     @abstractmethod
-    def fwd_actor(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-        ...
-
-    @abstractmethod
-    def fwd_critic(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
-        ...
-
-    @abstractmethod
-    def fwd_collector(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...], Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
-        ...
-
-    @abstractmethod
-    def fwd_recollector(
+    def act(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
-        get_distr: bool
-    ) -> 'tuple[tuple[Tensor, ...], Tensor, tuple[Tensor, ...]]':
+        sample: bool
+    ) -> 'tuple[Tensor, tuple[Tensor, ...]]':
         ...
 
     @abstractmethod
-    def fwd_learner(
+    def collect(
         self,
         obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]'
-    ) -> 'tuple[Distribution, Distribution, tuple[Tensor, ...]]':
+        mem: 'tuple[Tensor, ...]',
+        encode: bool
+    ) -> 'tuple[Tensor, Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
         ...
 
-    def forward(self, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]', mode: int = MODE_LEARNER):
-        return self.fwd_map[mode](obs, mem)
+    @abstractmethod
+    def forward(
+        self,
+        obs: 'tuple[Tensor, ...]',
+        mem: 'tuple[Tensor, ...]',
+        detach: bool
+    ) -> 'tuple[Distribution, Distribution, tuple[Tensor, ...]]':
+        ...
 
 
 class PPG:
@@ -117,7 +92,8 @@ class PPG:
         log_dir: str = 'runs',
         accelerate: bool = True,
         replay_rollout: bool = True,
-        update_returns: bool = True
+        update_returns: bool = True,
+        detach_critic: bool = True
     ):
         assert ckpt_tracker.model is not None and ckpt_tracker.optimiser is not None
 
@@ -132,6 +108,10 @@ class PPG:
         self.update_main_single_accel = None
         self.update_aux_single_accel = None
 
+        self.replay_rollout = replay_rollout
+        self.update_returns = update_returns
+        self.detach_critic = detach_critic
+
         self.writer = SummaryWriter(log_dir=os.path.join(log_dir, ckpt_tracker.model_name))
         self.write = self.writer.add_scalar
 
@@ -140,8 +120,6 @@ class PPG:
         self.checkpoint_interval = ckpt_epoch_interval
         self.branch_interval = branch_epoch_interval
 
-        self.update_returns = update_returns
-        self.replay_rollout = replay_rollout
         self.n_rollout_steps = n_rollout_steps
         self.n_truncated_steps = n_truncated_steps
         self.batch_size = batch_size
@@ -189,7 +167,7 @@ class PPG:
         """
 
         # Initial obs. and mem.
-        mem = self.model.init_mem(self.batch_size, detach=True)
+        mem = self.model.init_mem(self.batch_size)
         obs = self.env_step()[0]
 
         starting_step = epoch_step = self.ckpter.meta['epoch_step']
@@ -286,22 +264,25 @@ class PPG:
 
         self.ckpter.checkpoint(epoch_step, update_step, ckpt_increment, self.score)
 
-    def collect(self, obs: Tensor, mem: Tensor):
+    def collect(self, obs: Tensor, mem: Tensor) -> 'tuple[tuple[Tensor, ...], ...]':
         with torch.no_grad():
             for _ in range(self.n_rollout_steps):
 
                 # Step actor
-                sample, act, val, obs_enc, new_mem = self.model.fwd_collector(obs, mem)
+                act_out, val_mean, obs_enc, new_mem = self.model.collect(obs, mem, encode=True)
+
+                act = self.model.get_distr(act_out, from_raw=True)
+                act_sample = act.sample()
 
                 # Step env.
-                obs, rew, rst, info = self.env_step(sample[0])
+                obs, rew, rst, info = self.env_step(act_sample[0])
                 nonrst = 1. - rst
 
                 # Add batch to buffers
                 d = TensorDict({
-                    'sample': sample,
-                    'act': act,
-                    'val': val,
+                    'sample': act_sample,
+                    'act': act.args,
+                    'val': val_mean,
                     'obs': obs_enc,
                     'mem': mem,
                     'rew': rew,
@@ -327,7 +308,7 @@ class PPG:
                     self.stats[key] += val
 
             # Perform an additional critic pass to get the final values used in GAE
-            values, _ = self.model.fwd_critic(obs, mem)
+            _, values, _, _ = self.model.collect(obs, mem, encode=True)
 
             adv_mean, adv_std = self.main_buffer.label(values, self.discount_factor, self.gae_lambda)
 
@@ -343,13 +324,13 @@ class PPG:
             for b in self.aux_buffer.batches:
 
                 # Step actor
-                act, val, new_mem = self.model.fwd_recollector(b['obs'], mem, update_act)
+                act_out, val_mean, _, new_mem = self.model.collect(b['obs'], mem, encode=False)
 
                 # Update batch
                 if update_act:
-                    b['act'] = act
+                    b['act'] = self.model.get_distr(act_out, from_raw=True).args
 
-                b['val'] = val
+                b['val'] = val_mean
                 b['mem'] = mem
 
                 # Reset memory if any terminal states are reached
@@ -359,7 +340,7 @@ class PPG:
                     mem = self.model.reset_mem(mem, b['rst'])
 
             # Perform an additional critic pass to get the final values used in GAE
-            values, _ = self.model.fwd_critic(final_obs, mem)
+            _, values, _, _ = self.model.collect(final_obs, mem, encode=True)
 
         # Update target returns
         self.aux_buffer.label(values, self.discount_factor, self.gae_lambda, skip_std=True)
@@ -383,9 +364,10 @@ class PPG:
             # Burn-in on full trajectory up to this point in the rollout
             # NOTE: State correlations must be managed externally
             else:
-                mem = tuple([m.detach() for m in mem])
+                mem = [m.detach() for m in mem]
 
             # CUDA graph acceleration
+            # TODO: Mem. out. at first iter. of first epoch seems different from collector with same inputs and params.
             if self.accelerate:
 
                 # Flatten content of batches into a list of tensors to pass to the graph
@@ -396,7 +378,7 @@ class PPG:
                 if self.update_main_single_accel is None:
                     self.accel_main(batches, mem, full_input_list)
 
-                mem = tuple(self.update_main_single_accel(full_input_list))
+                mem = self.update_main_single_accel(full_input_list)
 
             else:
                 self.optimiser.zero_grad()
@@ -421,14 +403,14 @@ class PPG:
         running_loss = 0.
 
         for batch in batches:
-            act, val, mem = self.model(batch['obs'], mem)
+            act, val, mem = self.model(batch['obs'], mem, detach=self.detach_critic)
             act: Distribution
             val: Distribution
 
             mem = self.model.reset_mem(mem, batch['rst'])
 
             # Policy
-            old_act: Distribution = self.model.get_distr(batch['act'])
+            old_act: Distribution = self.model.get_distr(batch['act'], from_raw=False)
 
             act_log_prob = act.log_prob(*batch['sample'])
             old_act_log_prob = old_act.log_prob(*batch['sample'])
@@ -526,7 +508,7 @@ class PPG:
         batch_ref = batches[0]
 
         def update_main_single_accel(inputs: 'list[Tensor]') -> 'tuple[Tensor, ...]':
-            mem = [inputs.pop() for _ in range(n_mem_items)][::-1]
+            inputs, mem = inputs[:-n_mem_items], inputs[-n_mem_items:]
 
             input_len = len(inputs) // self.n_truncated_steps
             batches = [batch_ref.from_list(inputs[i:i+input_len]) for i in range(0, len(inputs), input_len)]
@@ -592,14 +574,14 @@ class PPG:
         running_loss = 0.
 
         for batch in batches:
-            act, val, mem = self.model(batch['obs'], mem)
+            act, val, mem = self.model(batch['obs'], mem, detach=False)
             act: Distribution
             val: Distribution
 
             mem = self.model.reset_mem(mem, batch['rst'])
 
             # KL divergence
-            old_act: Distribution = self.model.get_distr(batch['act'])
+            old_act: Distribution = self.model.get_distr(batch['act'], from_raw=False)
 
             kl_div = old_act.kl_div(act).mean()
 
@@ -639,7 +621,7 @@ class PPG:
         batch_ref = batches[0]
 
         def update_aux_single_accel(inputs: 'list[Tensor]') -> 'tuple[Tensor, ...]':
-            mem = [inputs.pop() for _ in range(n_mem_items)][::-1]
+            inputs, mem = inputs[:-n_mem_items], inputs[-n_mem_items:]
 
             input_len = len(inputs) // self.n_truncated_steps
             batches = [batch_ref.from_list(inputs[i:i+input_len]) for i in range(0, len(inputs), input_len)]

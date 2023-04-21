@@ -10,6 +10,7 @@ from torch.nn.functional import logsigmoid, log_softmax
 
 
 class Distribution:
+    args: 'tuple[Tensor, ...]'
     mean: Tensor
     mode: Tensor
     log_dev: Tensor
@@ -35,6 +36,10 @@ class MultiMixed(Distribution):
     def __init__(self, mcat: 'MultiCategorical', mnor: 'MultiNormal'):
         self.mcat = mcat
         self.mnor = mnor
+
+    @cached_property
+    def args(self) -> 'tuple[Tensor, ...]':
+        return self.mcat.log_probs, self.mnor.mean, self.mnor.log_dev
 
     @cached_property
     def mean(self) -> Tensor:
@@ -98,6 +103,10 @@ class MultiCategorical(Discrete):
             log_probs = (log_probs.unsqueeze(-1) + log_softmax(logits, dim=-1).unsqueeze(-2)).flatten(-2)
 
         return cls(values, log_probs)
+
+    @cached_property
+    def args(self) -> 'tuple[Tensor, ...]':
+        return self.log_probs,
 
     @cached_property
     def mean(self) -> Tensor:
@@ -226,6 +235,10 @@ class MultiNormal(Continuous):
         return cls(mean, log_dev, dev)
 
     @cached_property
+    def args(self) -> 'tuple[Tensor, ...]':
+        return self.mean, self.log_dev
+
+    @cached_property
     def var(self) -> Tensor:
         return self.dev ** 2
 
@@ -343,6 +356,10 @@ class FixedVarNormal(Continuous):
 
     def __init__(self, mean: Tensor):
         self.mode = self.mean = mean
+
+    @cached_property
+    def args(self) -> 'tuple[Tensor, ...]':
+        return self.mean,
 
     @cached_property
     def log_dev(self) -> Tensor:

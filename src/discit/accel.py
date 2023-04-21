@@ -19,14 +19,15 @@ def capture_graph(
     if warmup_tensor_list is None:
         warmup_tensor_list = [input_tensors]*3
 
-    s = cuda.Stream()
-    s.wait_stream(cuda.current_stream())
+    if warmup_tensor_list:
+        s = cuda.Stream()
+        s.wait_stream(cuda.current_stream())
 
-    with cuda.stream(s):
-        for warmup_tensors in warmup_tensor_list:
-            fn(warmup_tensors) if single_input else fn(*warmup_tensors)
+        with cuda.stream(s):
+            for warmup_tensors in warmup_tensor_list:
+                fn(warmup_tensors) if single_input else fn(*warmup_tensors)
 
-    cuda.current_stream().wait_stream(s)
+        cuda.current_stream().wait_stream(s)
 
     # Capture
     graph = cuda.CUDAGraph()
@@ -35,7 +36,7 @@ def capture_graph(
         output_tensors = fn(input_tensors) if single_input else fn(*input_tensors)
 
     # Copy all by default, otherwise copy inputs at given indices
-    if isinstance(input_tensors, Tensor) or input_tensors is None:
+    if isinstance(input_tensors, Tensor):
         input_tensors = (input_tensors,)
         single_input = False
 
@@ -43,17 +44,20 @@ def capture_graph(
         copy_idcs_in = range(len(input_tensors))
 
     copy_idcs_in = sorted(set(copy_idcs_in))
-    do_copy_in = bool(copy_idcs_in) and input_tensors is not None
+    do_copy_in = bool(copy_idcs_in)
 
     # Similar for outputs
-    single_output = isinstance(output_tensors, Tensor) or output_tensors is None
+    if output_tensors is None:
+        output_tensors = ()
+
+    single_output = isinstance(output_tensors, Tensor)
     n_out = 1 if single_output else len(output_tensors)
 
     if copy_idcs_out is None:
         copy_idcs_out = range(n_out)
 
     copy_idcs_out = sorted(set(copy_idcs_out))
-    do_copy_out = bool(copy_idcs_out) and output_tensors is not None
+    do_copy_out = bool(copy_idcs_out)
 
     # Check for nested inputs
     if do_copy_in and not all(isinstance(i, Tensor) for i in input_tensors):
