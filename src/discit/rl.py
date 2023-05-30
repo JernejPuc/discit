@@ -508,7 +508,11 @@ class PPG:
         batch_ref = batches[0]
 
         def update_main_single_accel(inputs: 'list[Tensor]') -> 'tuple[Tensor, ...]':
-            inputs, mem = inputs[:-n_mem_items], inputs[-n_mem_items:]
+            if n_mem_items:
+                inputs, mem = inputs[:-n_mem_items], inputs[-n_mem_items:]
+
+            else:
+                mem = []
 
             input_len = len(inputs) // self.n_truncated_steps
             batches = [batch_ref.from_list(inputs[i:i+input_len]) for i in range(0, len(inputs), input_len)]
@@ -621,7 +625,11 @@ class PPG:
         batch_ref = batches[0]
 
         def update_aux_single_accel(inputs: 'list[Tensor]') -> 'tuple[Tensor, ...]':
-            inputs, mem = inputs[:-n_mem_items], inputs[-n_mem_items:]
+            if n_mem_items:
+                inputs, mem = inputs[:-n_mem_items], inputs[-n_mem_items:]
+
+            else:
+                mem = []
 
             input_len = len(inputs) // self.n_truncated_steps
             batches = [batch_ref.from_list(inputs[i:i+input_len]) for i in range(0, len(inputs), input_len)]
