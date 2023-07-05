@@ -22,6 +22,8 @@ class CheckpointTracker:
         device: str = 'cuda',
         initial_seed: int = 42,
         transfer_name: str = '',
+        ver_to_transfer: int = None,
+        reset_step_on_transfer: bool = False,
         deterministic: bool = False
     ):
         if deterministic:
@@ -36,12 +38,12 @@ class CheckpointTracker:
         self.data_dir = os.path.join(data_dir, model_name)
         self.device = device
 
-        self.resume(initial_seed, transfer_name)
+        self.resume(initial_seed, transfer_name, ver_to_transfer, reset_step_on_transfer)
 
         self.model: 'Module | None' = None
         self.optimiser: 'Optimizer | None' = None
 
-    def resume(self, seed: int, transfer_name: str):
+    def resume(self, seed: int, transfer_name: str, ver_to_transfer: int, reset_step_on_transfer: bool):
         """Initialise the first or load the last checkpoint data of the current model."""
 
         # Load or create meta.json file
@@ -71,6 +73,13 @@ class CheckpointTracker:
 
             if transfer_name:
                 self.meta['name'] = self.model_name
+
+                if ver_to_transfer is not None:
+                    self.meta['ckpt_ver'] = ver_to_transfer
+
+                if reset_step_on_transfer:
+                    self.meta['epoch_step'] = 0
+                    self.meta['update_step'] = 0
 
         else:
             self.meta = {'ckpt_ctr': -1, 'ckpt_ver': 0, 'name': self.model_name}
