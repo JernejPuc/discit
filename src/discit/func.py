@@ -29,3 +29,24 @@ class TaLU(torch.autograd.Function):
         x = i.mul(10.).clamp_max_(0.).cosh_().pow_(-2).mul_(g)
 
         return x
+
+
+class WeightedGradDiscretise(torch.autograd.Function):
+    """
+    Output one hot samples instead of probabilities, but pass gradients
+    through the latter, weighted by importance.
+    """
+
+    @staticmethod
+    def forward(probs: Tensor, one_hots: Tensor) -> Tensor:
+        return one_hots
+
+    @staticmethod
+    def setup_context(ctx, inputs: 'tuple[Tensor, Tensor]', output: Tensor):
+        ctx.save_for_backward(*inputs)
+
+    @staticmethod
+    def backward(ctx, grad: Tensor) -> 'tuple[Tensor, None]':
+        probs, one_hots = ctx.saved_tensors
+
+        return grad * (probs * one_hots), None

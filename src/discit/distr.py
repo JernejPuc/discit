@@ -81,7 +81,7 @@ class MultiMixed(Distribution):
         return torch.cat((values_mcat, values_mnor), dim=-1), values_mnor, indices_mcat
 
 
-class MultiCategorical(Discrete):
+class ProdCategorical(Discrete):
     """
     Multiple independent categorical distributions multiplied and flattened
     to produce a single categorical distribution of larger dimension.
@@ -93,13 +93,13 @@ class MultiCategorical(Discrete):
         self.probs = log_probs.exp() if probs is None else probs
 
     @classmethod
-    def from_raw(cls, *logituple: 'tuple[Tensor, ...]', values: Tensor) -> 'MultiCategorical':
-        log_probs = log_softmax(logituple[0], dim=-1)
+    def from_raw(cls, values: Tensor, *logit_tpl: 'tuple[Tensor, ...]') -> 'ProdCategorical':
+        log_probs = log_softmax(logit_tpl[0], dim=-1)
 
-        if len(logituple) == 1:
-            return cls(values, log_probs, logituple[0].softmax(dim=-1))
+        if len(logit_tpl) == 1:
+            return cls(values, log_probs, logit_tpl[0].softmax(dim=-1))
 
-        for logits in logituple[1:]:
+        for logits in logit_tpl[1:]:
             log_probs = (log_probs.unsqueeze(-1) + log_softmax(logits, dim=-1).unsqueeze(-2)).flatten(-2)
 
         return cls(values, log_probs)
@@ -134,7 +134,7 @@ class MultiCategorical(Discrete):
     def entropy(self) -> Tensor:
         return -(self.probs * self.log_probs).sum(-1)
 
-    def kl_div(self, other: 'MultiCategorical') -> Tensor:
+    def kl_div(self, other: 'ProdCategorical') -> Tensor:
         return (self.probs * (self.log_probs - other.log_probs)).sum(-1)
 
     def log_prob(self, _values: Tensor, indices: Tensor) -> Tensor:
@@ -150,7 +150,10 @@ class MultiCategorical(Discrete):
         return values, indices
 
 
-class InterCategorical(MultiCategorical):
+Categorical = ProdCategorical
+
+
+class InterCategorical(Categorical):
     """
     Categorical distribution where values stand for delimiters between bins.
     Probability of an arbitrary value is interpolated in proportion to
@@ -190,6 +193,75 @@ class InterCategorical(MultiCategorical):
             self.probs.gather(-1, indices_below.unsqueeze(-1)),
             self.probs.gather(-1, indices_above.unsqueeze(-1)),
             ratio.unsqueeze(-1)).squeeze(-1)
+
+
+class MultiCategorical(Distribution):
+    def __init__(self, value_tpl: 'tuple[Tensor, ...]', log_prob_tpl: 'tuple[Tensor, ...]'):
+        self.distrs = [Categorical(*args) for args in zip(value_tpl, log_prob_tpl)]
+        self.log_prob_tpl = log_prob_tpl
+
+    @classmethod
+    def from_raw(
+        cls,
+        value_tpl: 'tuple[Tensor, ...]',
+        logits: 'Tensor | tuple[Tensor, ...]',
+        logits_are_split: bool = True
+    ) -> 'MultiCategorical':
+
+        if logits_are_split:
+            logit_tpl = logits
+
+        else:
+            logit_tpl = logits.split([len(values) for values in value_tpl], dim=-1)
+
+        log_prob_tpl = tuple([log_softmax(logits, dim=-1) for logits in logit_tpl])
+
+        return cls(value_tpl, log_prob_tpl)
+
+    @cached_property
+    def args(self) -> 'tuple[Tensor, ...]':
+        return self.log_prob_tpl
+
+    @cached_property
+    def mean(self) -> Tensor:
+        return torch.cat([d.mean for d in self.distrs], dim=-1)
+
+    @cached_property
+    def mode(self) -> Tensor:
+        return torch.cat([d.mode for d in self.distrs], dim=-1)
+
+    @cached_property
+    def log_dev(self) -> Tensor:
+        return self.dev.log()
+
+    @cached_property
+    def dev(self) -> Tensor:
+        return self.var.sqrt()
+
+    @cached_property
+    def var(self) -> Tensor:
+        return torch.cat([d.var for d in self.distrs], dim=-1)
+
+    @cached_property
+    def entropy(self) -> Tensor:
+        return torch.stack([d.entropy for d in self.distrs]).sum(0)
+
+    def kl_div(self, other: 'MultiCategorical') -> Tensor:
+        return torch.stack([sd.kl_div(od) for sd, od in zip(self.distrs, other.distrs)]).sum(0)
+
+    def log_prob(self, _values: Tensor, index_stack: Tensor) -> Tensor:
+        return torch.stack([d.log_prob(None, indices) for d, indices in zip(self.distrs, index_stack)]).sum(0)
+
+    def prob(self, _values: Tensor, index_stack: Tensor) -> Tensor:
+        return torch.stack([d.prob(None, indices) for d, indices in zip(self.distrs, index_stack)]).sum(0)
+
+    def sample(self) -> 'tuple[Tensor, Tensor]':
+        samples = [d.sample() for d in self.distrs]
+
+        values = torch.cat([sample[0] for sample in samples], dim=-1)
+        index_stack = torch.stack([sample[1] for sample in samples])
+
+        return values, index_stack
 
 
 class MultiNormal(Continuous):

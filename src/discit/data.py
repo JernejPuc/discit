@@ -142,7 +142,7 @@ class TensorDict(dict):
         'obs': 'tuple[Tensor, ...]',
         'mem': 'tuple[Tensor, ...]',
         'rew': Tensor,
-        'ret': Tensor,
+        'ret': 'tuple[Tensor, ...]',
         'adv': Tensor,
         'rst': Tensor,
         'nonrst': Tensor}
@@ -479,7 +479,7 @@ class ExperienceBuffer:
             values = batch['val']
 
             batch['adv'] = advantages
-            batch['ret'] = advantages + values
+            batch['ret'] = (advantages + values, *batch['ret'][1:])
 
         if skip_std:
             return

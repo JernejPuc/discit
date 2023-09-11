@@ -88,6 +88,7 @@ class PPG:
         gae_lambda: float = 0.95,
         clip_ratio: float = 0.2,
         value_weight: float = 0.5,
+        aux_weight: float = 0.,
         entropy_weight: float = 3e-4,
         log_dir: str = 'runs',
         accelerate: bool = True,
@@ -130,6 +131,7 @@ class PPG:
         self.gae_lambda = gae_lambda
         self.clip_ratio = clip_ratio
         self.value_weight = value_weight
+        self.aux_weight = aux_weight
         self.entropy_weight = entropy_weight
 
         self.main_buffer = ExperienceBuffer(n_rollout_steps)
@@ -151,12 +153,14 @@ class PPG:
             'Main/loss': new_zero_tensor(),
             'Main/policy': new_zero_tensor(),
             'Main/value': new_zero_tensor(),
+            'Main/aux': new_zero_tensor(),
             'Main/entropy': new_zero_tensor(),
             'Main/ratio_diff': new_zero_tensor(),
             'GAE/adv_mean': new_zero_tensor(),
             'GAE/adv_std': new_zero_tensor(),
             'Aux/loss': new_zero_tensor(),
             'Aux/value': new_zero_tensor(),
+            'Aux/aux': new_zero_tensor(),
             'Aux/kl_div': new_zero_tensor()}
 
     def run(self):
@@ -275,8 +279,11 @@ class PPG:
                 act_sample = act.sample()
 
                 # Step env.
-                obs, rew, rst, info = self.env_step(act_sample[0])
+                obs, rew, rst, *val_aux, info = self.env_step(act_sample[0])
                 nonrst = 1. - rst
+
+                # Placeholder and aux
+                ret = (val_mean, *val_aux)
 
                 # Add batch to buffers
                 d = TensorDict({
@@ -286,6 +293,7 @@ class PPG:
                     'obs': obs_enc,
                     'mem': mem,
                     'rew': rew,
+                    'ret': ret,
                     'rst': rst,
                     'nonrst': nonrst})
 
@@ -403,9 +411,12 @@ class PPG:
         running_loss = 0.
 
         for batch in batches:
-            act, val, mem = self.model(batch['obs'], mem, detach=self.detach_critic)
+            act, val, *aux, mem = self.model(batch['obs'], mem, detach=self.detach_critic)
+            ret, *ref_aux = batch['ret']
+
             act: Distribution
             val: Distribution
+            aux: 'tuple[Distribution]'
 
             mem = self.model.reset_mem(mem, batch['rst'])
 
@@ -426,13 +437,24 @@ class PPG:
 
             # Value
             # NOTE: No value loss clipping
-            value_loss = -val.log_prob(batch['ret'].unsqueeze(-1)).mean()
+            value_loss = -val.log_prob(ret.unsqueeze(-1)).mean()
+
+            # Auxiliary
+            aux_loss = 0.
+
+            for aux_i, ref_aux_i in zip(aux, ref_aux):
+                aux_loss = aux_loss - aux_i.log_prob(ref_aux_i).mean()
 
             # Entropy
             entropy = act.entropy.mean()
 
             # Total
-            full_loss = policy_loss + self.value_weight * value_loss - self.entropy_weight * entropy
+            full_loss = (
+                policy_loss
+                + self.value_weight * value_loss
+                + self.aux_weight * aux_loss
+                - self.entropy_weight * entropy)
+
             running_loss = running_loss + full_loss
 
             # Stats for logging
@@ -449,6 +471,7 @@ class PPG:
                 stats['Main/loss'] += full_loss
                 stats['Main/policy'] += policy_loss
                 stats['Main/value'] += value_loss
+                stats['Main/aux'] += aux_loss
                 stats['Main/entropy'] += entropy
                 stats['Main/ratio_diff'] += ratio_diff
                 stats['Env/reward'] += reward
@@ -578,9 +601,12 @@ class PPG:
         running_loss = 0.
 
         for batch in batches:
-            act, val, mem = self.model(batch['obs'], mem, detach=False)
+            act, val, *aux, mem = self.model(batch['obs'], mem, detach=False)
+            ret, *ref_aux = batch['ret']
+
             act: Distribution
             val: Distribution
+            aux: 'tuple[Distribution]'
 
             mem = self.model.reset_mem(mem, batch['rst'])
 
@@ -591,10 +617,16 @@ class PPG:
 
             # Value
             # NOTE: No value loss clipping
-            value_loss = -val.log_prob(batch['ret'].unsqueeze(-1)).mean()
+            value_loss = -val.log_prob(ret.unsqueeze(-1)).mean()
+
+            # Auxiliary
+            aux_loss = 0.
+
+            for aux_i, ref_aux_i in zip(aux, ref_aux):
+                aux_loss = aux_loss - aux_i.log_prob(ref_aux_i).mean()
 
             # Total
-            full_loss = value_loss + kl_div
+            full_loss = value_loss + self.aux_weight * aux_loss + kl_div
             running_loss = running_loss + full_loss
 
             # Stats for logging
@@ -604,6 +636,7 @@ class PPG:
 
                 stats['Aux/loss'] += full_loss
                 stats['Aux/value'] += value_loss
+                stats['Aux/aux'] += aux_loss
                 stats['Aux/kl_div'] += kl_div
 
         # Average loss over N time steps for TBPTT
