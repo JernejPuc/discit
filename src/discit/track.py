@@ -1,6 +1,7 @@
 """Tracking"""
 
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any
@@ -38,6 +39,15 @@ class CheckpointTracker:
         self.data_dir = os.path.join(data_dir, model_name)
         self.device = device
 
+        self.log_path = os.path.join(self.data_dir, 'log.txt')
+        log_handler = logging.FileHandler(self.log_path)
+        log_handler.setLevel(logging.DEBUG)
+        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+        self.logger = logging.getLogger(name=model_name)
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.addHandler(log_handler)
+
         self.resume(initial_seed, transfer_name, ver_to_transfer, reset_step_on_transfer)
 
         self.model: 'Module | None' = None
@@ -72,6 +82,8 @@ class CheckpointTracker:
             self.meta = meta_data[sorted(meta_data.keys())[-1]]
 
             if transfer_name:
+                self.logger.info(f'Starting from model {transfer_name} ver. {ver_to_transfer}.')
+
                 self.meta['name'] = self.model_name
 
                 if ver_to_transfer is not None:
@@ -97,6 +109,8 @@ class CheckpointTracker:
             if self.device == 'cuda' and ckpt['pt_rng_cuda']:
                 torch.cuda.set_rng_state(torch.tensor(ckpt['pt_rng_cuda'], dtype=torch.uint8))
 
+            log_text = f'Resumed state from ckpt. {self.meta["ckpt_ver"]}.'
+
         # Init. new RNG states
         else:
             if seed is None:
@@ -105,17 +119,10 @@ class CheckpointTracker:
             self.rng = np.random.default_rng(seed)
             torch.random.manual_seed(seed)
 
+            log_text = f'Creating state ckpt. {self.meta["ckpt_ver"]}.'
+
         # Report on init or load event via log.txt file
-        log_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        if os.path.exists(log_path := os.path.join(self.data_dir, 'log.txt')):
-            log_text = f'Resumed state from ckpt. {self.meta["ckpt_ver"]}.'
-
-        else:
-            log_text = f'Created state ckpt. {self.meta["ckpt_ver"]}.'
-
-        with open(log_path, 'a') as log_file:
-            log_file.write(f'{log_time} | {log_text}\n')
+        self.logger.info(log_text)
 
         print(log_text)
 
@@ -138,7 +145,7 @@ class CheckpointTracker:
         with open(os.path.join(self.data_dir, 'meta.json'), 'r') as meta_file:
             meta_data = json.load(meta_file)
 
-        meta_data[(log_time := datetime.now().strftime('%Y-%m-%d %H:%M:%S'))] = self.meta
+        meta_data[datetime.now().strftime('%Y-%m-%d %H:%M:%S')] = self.meta
 
         # Save meta backup
         with open(os.path.join(self.data_dir, 'meta_backup.json'), 'w') as meta_file:
@@ -170,8 +177,7 @@ class CheckpointTracker:
         # Report on checkpoint event via log
         log_text = f'Saved ckpt. ver. {self.meta["ckpt_ver"]} on epoch {self.meta["epoch_step"]}.'
 
-        with open(os.path.join(self.data_dir, 'log.txt'), 'a') as log_file:
-            log_file.write(f'{log_time} | {log_text}\n')
+        self.logger.info(log_text)
 
         print(f'\n{log_text}')
 

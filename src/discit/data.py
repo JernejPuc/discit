@@ -419,7 +419,12 @@ class ExperienceBuffer:
 
         return weights
 
-    def stack(self, n_slices: int) -> 'ExperienceBuffer':
+    def restack(self, n_to_unstack: int, rng: np.random.Generator = None) -> 'ExperienceBuffer':
+        """Change batch size based on the argument's sign."""
+
+        return self.unstack(n_to_unstack, rng) if n_to_unstack > 0 else self.stack(-n_to_unstack, rng)
+
+    def stack(self, n_slices: int, rng: np.random.Generator = None) -> 'ExperienceBuffer':
         """Increase batch size by stacking multiple buffer slices."""
 
         if n_slices < 2:
@@ -431,14 +436,21 @@ class ExperienceBuffer:
         if self.bind_ptr < self.buffer_len:
             raise RuntimeError('Need full buffer to stack.')
 
-        slice_len = self.buffer_len // n_slices
-        batch_ref = self.batches[0]
+        # Optional shuffle
+        if rng is not None:
+            batches = [self.batches[i] for i in rng.permutation(self.buffer_len)]
 
-        batches = [batch_ref.cat_alike(self.batches[i::slice_len]) for i in range(slice_len)]
+        else:
+            batches = self.batches
+
+        slice_len = self.buffer_len // n_slices
+        batch_ref = batches[0]
+
+        batches = [batch_ref.cat_alike(batches[i::slice_len]) for i in range(slice_len)]
 
         return ExperienceBuffer(slice_len, data=(batches, slice_len))
 
-    def unstack(self, n_slices: int) -> 'ExperienceBuffer':
+    def unstack(self, n_slices: int, rng: np.random.Generator = None) -> 'ExperienceBuffer':
         """Reduce batch size by splitting batches into multiple buffer slices."""
 
         if n_slices < 2:
@@ -452,11 +464,19 @@ class ExperienceBuffer:
         if batch_size % n_slices or n_slices > batch_size:
             raise ValueError(f'Slice num. ({n_slices}) inconsistent with batch size ({batch_size}).')
 
+        # Optional batch-wise shuffle
+        if rng is not None:
+            idcs = rng.permutation(batch_size)
+            batches = [b.slice(idcs) for b in self.batches]
+
+        else:
+            batches = self.batches
+
         buffer_len = self.buffer_len * n_slices
         new_size = batch_size // n_slices
         slices = [slice(i, i+new_size) for i in range(0, batch_size, new_size)]
 
-        batches = [b.slice(s) for s in slices for b in self.batches]
+        batches = [b.slice(s) for s in slices for b in batches]
 
         return ExperienceBuffer(buffer_len, data=(batches, buffer_len))
 
@@ -469,13 +489,13 @@ class ExperienceBuffer:
         if not all(self.batches):
             raise RuntimeError('Need full buffer to label.')
 
-        advantages = torch.zeros_like(self.batches[-1]['rew'])
+        advantages = torch.zeros_like(values)
 
         # NOTE: Final values (future returns) in an episode are assumed to be zeros
         # Earlier returns are based (bootstrapped) on the model's estimates
         for batch in reversed(self.batches):
             deltas = batch['rew'] + batch['nonrst'] * gamma * values - batch['val']
-            advantages = deltas + batch['nonrst'] * gamma * lam * advantages
+            advantages = deltas + batch['nonrst'] * (gamma * lam) * advantages
             values = batch['val']
 
             batch['adv'] = advantages

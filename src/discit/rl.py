@@ -82,6 +82,7 @@ class PPG:
         n_rollout_steps: int = 256,
         n_truncated_steps: int = 16,
         batch_size: int = 256,
+        n_minibatches: int = 1,
         n_main_iters: int = 8,
         n_aux_iters: int = 6,
         discount_factor: float = 0.99,
@@ -124,6 +125,9 @@ class PPG:
         self.n_rollout_steps = n_rollout_steps
         self.n_truncated_steps = n_truncated_steps
         self.batch_size = batch_size
+        self.n_minibatches = n_minibatches
+        self.resize_batches = abs(n_minibatches) < 2
+        self.shuffle_rng = self.ckpter.rng if self.resize_batches and n_minibatches > 0 else None
 
         self.n_main_iters = n_main_iters
         self.n_aux_iters = n_aux_iters
@@ -193,18 +197,33 @@ class PPG:
 
                 obs, mem = self.collect(obs, mem)
 
-                mem = self.update_main(i)
+                if self.resize_batches:
+                    self.main_buffer = self.main_buffer.restack(self.n_minibatches, self.shuffle_rng)
+
+                updated_mem = self.update_main(i)
+
+                if not self.resize_batches:
+                    mem = updated_mem
 
                 self.main_buffer.clear()
 
             # Aux phase
+            if self.resize_batches and not self.update_returns:
+                self.aux_buffer = self.aux_buffer.restack(self.n_minibatches, self.shuffle_rng)
+
             for i in range(1, self.n_aux_iters+1):
                 self.print_progress(progress, remaining_time, epoch_step, i, False)
 
                 if self.update_returns:
                     self.recollect(obs, i == 1)
 
-                mem = self.update_aux()
+                    if self.resize_batches:
+                        self.aux_buffer = self.aux_buffer.restack(self.n_minibatches, self.shuffle_rng)
+
+                updated_mem = self.update_aux()
+
+            if not self.resize_batches:
+                mem = updated_mem
 
             self.aux_buffer.clear()
 
@@ -350,8 +369,8 @@ class PPG:
             # Perform an additional critic pass to get the final values used in GAE
             _, values, _, _ = self.model.collect(final_obs, mem, encode=True)
 
-        # Update target returns
-        self.aux_buffer.label(values, self.discount_factor, self.gae_lambda, skip_std=True)
+            # Update target returns
+            self.aux_buffer.label(values, self.discount_factor, self.gae_lambda, skip_std=True)
 
     def update_main(self, iter_num: int) -> 'tuple[Tensor, ...]':
         """
