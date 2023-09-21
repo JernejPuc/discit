@@ -13,13 +13,17 @@ class LoadedDataset:
 
     def __init__(
         self,
-        file_path: str,
+        data: 'Tensor | np.ndarray',
         batch_size: int,
         device: str = 'cuda',
         shuffle: bool = True,
         shuffle_on_cpu: bool = False
     ):
-        self.data = torch.load(file_path).to(device)
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+
+        self.data = data.to(device)
+
         self.batch_size = batch_size
         self.device = torch.device(device)
         self.shuffle = shuffle
@@ -40,17 +44,18 @@ class LoadedDataset:
             else:
                 self.data = self.data[torch.randperm(self.len, device=self.device)]
 
-        self.iter_ptr = -self.batch_size
+        self.iter_ptr = 0
 
         return self
 
     def __next__(self) -> Tensor:
+        curr_iter_ptr = self.iter_ptr
         self.iter_ptr += self.batch_size
 
-        if self.iter_ptr == self.len:
+        if self.iter_ptr > self.len:
             raise StopIteration
 
-        return self.data[self.iter_ptr:self.iter_ptr+self.batch_size]
+        return self.data[curr_iter_ptr:self.iter_ptr]
 
 
 class SideLoadingDataset:
@@ -67,7 +72,7 @@ class SideLoadingDataset:
 
     def __init__(
         self,
-        file_path: str,
+        data: 'Tensor | np.ndarray',
         batch_size: int,
         device: str = 'cuda',
         shuffle: bool = True,
@@ -75,7 +80,11 @@ class SideLoadingDataset:
     ):
         assert device.startswith('cuda'), f'Dataset expected cuda, got {device}.'
 
-        self.data = torch.load(file_path)
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+
+        self.data = data
+
         self.batch_size = batch_size
         self.device = torch.device(device)
         self.shuffle = shuffle
@@ -101,7 +110,7 @@ class SideLoadingDataset:
 
                 self.data = self.data.pin_memory()
 
-        self.iter_ptr = -self.batch_size
+        self.iter_ptr = 0
 
         # Load on side stream
         with cuda.stream(self.stream):
@@ -110,9 +119,10 @@ class SideLoadingDataset:
         return self
 
     def __next__(self) -> Tensor:
+        curr_iter_ptr = self.iter_ptr
         self.iter_ptr += self.batch_size
 
-        if self.iter_ptr == self.len:
+        if self.iter_ptr > self.len:
             self.next_batch = None
 
             raise StopIteration
@@ -127,7 +137,7 @@ class SideLoadingDataset:
 
         # Load on side stream
         with cuda.stream(self.stream):
-            self.next_batch = self.data[self.iter_ptr:self.iter_ptr+self.batch_size].to(self.device, non_blocking=True)
+            self.next_batch = self.data[curr_iter_ptr:self.iter_ptr].to(self.device, non_blocking=True)
 
         return batch
 

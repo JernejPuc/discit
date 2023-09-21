@@ -15,6 +15,7 @@ from torch.optim import Optimizer
 class CheckpointTracker:
     meta: 'dict[str, Any]'
     rng: np.random.Generator
+    logger: logging.Logger
 
     def __init__(
         self,
@@ -40,14 +41,6 @@ class CheckpointTracker:
         self.device = device
 
         self.log_path = os.path.join(self.data_dir, 'log.txt')
-        log_handler = logging.FileHandler(self.log_path)
-        log_handler.setLevel(logging.DEBUG)
-        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-
-        self.logger = logging.getLogger(name=model_name)
-        self.logger.setLevel(logging.DEBUG)
-        self.logger.addHandler(log_handler)
-
         self.resume(initial_seed, transfer_name, ver_to_transfer, reset_step_on_transfer)
 
         self.model: 'Module | None' = None
@@ -76,6 +69,15 @@ class CheckpointTracker:
 
             else:
                 meta_data = None
+
+        # Init. logger
+        log_handler = logging.FileHandler(self.log_path)
+        log_handler.setLevel(logging.DEBUG)
+        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+        self.logger = logging.getLogger(name=self.model_name)
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.addHandler(log_handler)
 
         # Load or create initial meta data
         if meta_data:
