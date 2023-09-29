@@ -12,7 +12,8 @@ def capture_graph(
     copy_idcs_in: 'tuple[int, ...]' = None,
     copy_idcs_out: 'tuple[int, ...]' = None,
     single_input: bool = False,
-    mem_pool: 'tuple[int, int]' = None
+    mem_pool: 'tuple[int, int]' = None,
+    device: 'str' = None
 ) -> 'tuple[Callable, dict[str, tuple[Tensor, ...] | cuda.CUDAGraph | Callable]]':
 
     # Warmup
@@ -20,19 +21,25 @@ def capture_graph(
         warmup_tensor_list = [input_tensors]*3
 
     if warmup_tensor_list:
-        s = cuda.Stream()
-        s.wait_stream(cuda.current_stream())
+        s = cuda.Stream(device)
+        s.wait_stream(cuda.current_stream(device))
 
         with cuda.stream(s):
             for warmup_tensors in warmup_tensor_list:
                 fn(warmup_tensors) if single_input else fn(*warmup_tensors)
 
-        cuda.current_stream().wait_stream(s)
+        cuda.current_stream(device).wait_stream(s)
 
     # Capture
     graph = cuda.CUDAGraph()
 
-    with cuda.graph(graph, pool=mem_pool):
+    if device is None:
+        capture_stream = None
+
+    else:
+        capture_stream = cuda.Stream(device)
+
+    with cuda.graph(graph, pool=mem_pool, stream=capture_stream):
         output_tensors = fn(input_tensors) if single_input else fn(*input_tensors)
 
     # Copy all by default, otherwise copy inputs at given indices

@@ -109,7 +109,7 @@ class CheckpointTracker:
             torch.set_rng_state(torch.tensor(ckpt['pt_rng'], dtype=torch.uint8))
 
             if self.device == 'cuda' and ckpt['pt_rng_cuda']:
-                torch.cuda.set_rng_state(torch.tensor(ckpt['pt_rng_cuda'], dtype=torch.uint8))
+                torch.cuda.set_rng_state(torch.tensor(ckpt['pt_rng_cuda'], dtype=torch.uint8), self.device)
 
             log_text = f'Resumed state from ckpt. {self.meta["ckpt_ver"]}.'
 
@@ -172,7 +172,7 @@ class CheckpointTracker:
                 'optim': optim_state,
                 'np_rng': self.rng.__getstate__(),
                 'pt_rng': torch.get_rng_state().tolist(),
-                'pt_rng_cuda': torch.cuda.get_rng_state().tolist() if self.device == 'cuda' else [],
+                'pt_rng_cuda': torch.cuda.get_rng_state(self.device).tolist() if self.device.startswith('cuda') else [],
                 **self.meta},
             self.meta['ckpt_path'])
 

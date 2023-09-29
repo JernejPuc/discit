@@ -126,7 +126,7 @@ class PPG:
         self.n_truncated_steps = n_truncated_steps
         self.batch_size = batch_size
         self.n_minibatches = n_minibatches
-        self.resize_batches = abs(n_minibatches) < 2
+        self.resize_batches = abs(n_minibatches) > 2
         self.shuffle_rng = self.ckpter.rng if self.resize_batches and n_minibatches > 0 else None
 
         self.n_main_iters = n_main_iters
