@@ -89,7 +89,11 @@ class CheckpointTracker:
                 self.meta['name'] = self.model_name
 
                 if ver_to_transfer is not None:
+                    transfer_dir = os.path.join(os.path.dirname(self.data_dir), transfer_name)
+
                     self.meta['ckpt_ver'] = ver_to_transfer
+                    self.meta['model_path'] = os.path.join(transfer_dir, f'model_{ver_to_transfer:03d}.pt')
+                    self.meta['ckpt_path'] = os.path.join(transfer_dir, f'ckpt_{ver_to_transfer:03d}.pt')
 
                 if reset_step_on_transfer:
                     self.meta['epoch_step'] = 0
@@ -101,14 +105,14 @@ class CheckpointTracker:
 
         # Load checkpoint data and set RNG states
         if os.path.exists(path := self.meta['ckpt_path']):
-            ckpt = torch.load(path)
+            ckpt = torch.load(path, map_location=self.device)
 
             self.rng = np.random.default_rng()
             self.rng.__setstate__(ckpt['np_rng'])
 
             torch.set_rng_state(torch.tensor(ckpt['pt_rng'], dtype=torch.uint8))
 
-            if self.device == 'cuda' and ckpt['pt_rng_cuda']:
+            if self.device.startswith('cuda') and ckpt['pt_rng_cuda']:
                 torch.cuda.set_rng_state(torch.tensor(ckpt['pt_rng_cuda'], dtype=torch.uint8), self.device)
 
             log_text = f'Resumed state from ckpt. {self.meta["ckpt_ver"]}.'
@@ -190,7 +194,7 @@ class CheckpointTracker:
         self.optimiser = optimiser
 
         if path_exists := os.path.exists(path := self.meta['ckpt_path']):
-            ckpt = torch.load(path)
+            ckpt = torch.load(path, map_location=self.device)
 
             if (state := ckpt['model']) is not None:
                 model.load_state_dict(state)
