@@ -160,7 +160,7 @@ class InterCategorical(Categorical):
     probabilities of the two bounding values.
     """
 
-    def log_prob(self, values: Tensor, _indices: Tensor = None) -> Tensor:
+    def _lerp_between(self, refs: Tensor, values: Tensor) -> Tensor:
         values = values.squeeze(-1)
         delims = self.values.squeeze(-1)
 
@@ -173,26 +173,15 @@ class InterCategorical(Categorical):
         ratio = (values - values_below) / (values_above - values_below)
 
         return torch.lerp(
-            self.log_probs.gather(-1, indices_below.unsqueeze(-1)),
-            self.log_probs.gather(-1, indices_above.unsqueeze(-1)),
+            refs.gather(-1, indices_below.unsqueeze(-1)),
+            refs.gather(-1, indices_above.unsqueeze(-1)),
             ratio.unsqueeze(-1)).squeeze(-1)
+
+    def log_prob(self, values: Tensor, _indices: Tensor = None) -> Tensor:
+        return self._lerp_between(self.log_probs, values)
 
     def prob(self, values: Tensor, _indices: Tensor = None) -> Tensor:
-        values = values.squeeze(-1)
-        delims = self.values.squeeze(-1)
-
-        indices_above = torch.bucketize(values, delims).clip(1)
-        indices_below = indices_above - 1
-
-        values_above = delims.index_select(0, indices_above)
-        values_below = delims.index_select(0, indices_below)
-
-        ratio = (values - values_below) / (values_above - values_below)
-
-        return torch.lerp(
-            self.probs.gather(-1, indices_below.unsqueeze(-1)),
-            self.probs.gather(-1, indices_above.unsqueeze(-1)),
-            ratio.unsqueeze(-1)).squeeze(-1)
+        return self._lerp_between(self.probs, values)
 
 
 class MultiCategorical(Distribution):
@@ -337,97 +326,24 @@ class MultiNormal(Continuous):
         return torch.normal(self.mean, self.dev),
 
 
-class ClippedNormal(MultiNormal):
-    """
-    Clipped independent multivariate normal distribution, where samples are
-    bound to an interval and probabilities at the bounds integrate
-    the overflowing density.
-    """
-
-    _LOG_05 = log(0.5)
-    _SQRT_2 = sqrt(2.)
-
-    def __init__(self, mean: Tensor, log_dev: Tensor, dev: Tensor = None, low: float = None, high: float = None):
-        MultiNormal.__init__(self, mean, log_dev, dev)
-
-        self.low = low
-        self.high = high
-
-    @classmethod
-    def from_raw(
-        cls,
-        mean: Tensor,
-        pseudo_log_dev: Tensor,
-        log_dev_bias: float = None,
-        dev_bias: float = None,
-        max_mean: float = None,
-        low: float = None,
-        high: float = None
-    ) -> 'ClippedNormal':
-
-        if max_mean:
-            mean = (mean / max_mean).tanh() * max_mean
-
-        if log_dev_bias:
-            pseudo_log_dev = pseudo_log_dev + log_dev_bias
-
-        if dev_bias:
-            dev = pseudo_log_dev.sigmoid() + dev_bias
-            log_dev = dev.log()
-
-        else:
-            dev = pseudo_log_dev.sigmoid()
-            log_dev = logsigmoid(pseudo_log_dev)
-
-        return cls(mean, log_dev, dev, low, high)
-
-    @cached_property
-    def _sqrt_2_dev(self) -> Tensor:
-        return self._SQRT_2 * self.dev
-
-    def log_prob(self, values: Tensor) -> Tensor:
-        log_prob = -((values - self.mean)**2 / self._double_var + self._LOG_SQRT_2PI + self.log_dev)
-
-        if self.high:
-            log_prob_high = self._LOG_05 + ((1. + 1e-6) - ((self.high - self.mean) / self._sqrt_2_dev).erf()).log()
-            log_prob = log_prob.lerp(log_prob_high, (values > self.high).float())
-
-        if self.low:
-            log_prob_low = self._LOG_05 + ((1. + 1e-6) + ((self.low - self.mean) / self._sqrt_2_dev).erf()).log()
-            log_prob = log_prob.lerp(log_prob_low, (values < self.low).float())
-
-        return log_prob.sum(-1)
-
-    def prob(self, values: Tensor) -> Tensor:
-        prob = (-(values - self.mean)**2 / self._double_var).exp() / (self._SQRT_2PI * self.dev)
-
-        if self.high:
-            prob_high = 0.5 * ((1. + 1e-6) - ((self.high - self.mean) / self._sqrt_2_dev).erf())
-            prob = prob.lerp(prob_high, (values > self.high).float())
-
-        if self.low:
-            prob_low = 0.5 * ((1. + 1e-6) + ((self.low - self.mean) / self._sqrt_2_dev).erf())
-            prob = prob.lerp(prob_low, (values < self.low).float())
-
-        return prob.prod(-1)
-
-    def sample(self) -> 'tuple[Tensor]':
-        return torch.normal(self.mean, self.dev).clamp_(self.low, self.high),
-
-
 class FixedVarNormal(Continuous):
     """
     Normal distribution with fixed variance of 0.5, the log_prob of which
-    corresponds to a slight shift of the negative mean squared error
+    corresponds to a slight shift of the negative squared error
     (with the same derivative).
+
+    NOTE: Shifting can be skipped to retrieve the original error term.
+    In that case, log_prob will not correspond to actual probability density,
+    but gradient-based optimisation should not be affected.
     """
 
     _NEG_LOG_SQRT_PI = -0.5 * log(pi)
     _LOG_SQRT_2PIE = 0.5 * (log(2.) + log(pi) + 1.)
     _SQRT_PI = sqrt(pi)
 
-    def __init__(self, mean: Tensor):
+    def __init__(self, mean: Tensor, skip_log_shift: bool = False):
         self.mode = self.mean = mean
+        self.skip_log_shift = skip_log_shift
 
     @cached_property
     def args(self) -> 'tuple[Tensor, ...]':
@@ -453,7 +369,7 @@ class FixedVarNormal(Continuous):
         return (self.mean - othr.mean).square().sum(-1)
 
     def log_prob(self, values: Tensor) -> Tensor:
-        return (-(self.mean - values)**2 + self._NEG_LOG_SQRT_PI).sum(-1)
+        return (-(self.mean - values)**2 + (0. if self.skip_log_shift else self._NEG_LOG_SQRT_PI)).sum(-1)
 
     def prob(self, values: Tensor) -> Tensor:
         return ((-(self.mean - values)**2).exp() / self._SQRT_PI).prod(-1)

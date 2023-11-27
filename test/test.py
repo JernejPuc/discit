@@ -36,7 +36,7 @@ class TestDistributions(unittest.TestCase):
 
         # Distribution
         mcat_distr = distributions.MultiCategorical.from_raw(logits_1, logits_2, values=values)
-        mnor_distr = distributions.ClippedNormal.from_raw(mean, pseudo_log_dev, -np.log(3), 0.01, 3., 0., 1.)
+        mnor_distr = distributions.MultiNormal.from_raw(mean, pseudo_log_dev, -np.log(3), 0.01, 3.)
 
         distr = distributions.MultiMixed(mcat_distr, mnor_distr)
         other_distr = distr
@@ -164,33 +164,6 @@ class TestDistributions(unittest.TestCase):
             self.assertEqual(attr.shape[1], n_cont_vars, i)
 
         for i, attr in enumerate((distr.entropy, prob, log_prob, kl_div)):
-            self.assertEqual(len(attr.shape), 1, i)
-            self.assertEqual(len(attr), BATCH_SIZE, i)
-
-    def test_clipped_normal(self):
-        rng = np.random.default_rng(RNG_SEED)
-
-        # Values
-        n_cont_vars = 3
-
-        # Raw inputs
-        mean = torch.from_numpy(rng.random((BATCH_SIZE, n_cont_vars), dtype=np.float32))
-        pseudo_log_dev = torch.from_numpy(rng.random((BATCH_SIZE, n_cont_vars), dtype=np.float32))
-
-        # Distribution
-        distr = distributions.ClippedNormal.from_raw(mean, pseudo_log_dev, -np.log(3), 0.01, 3., 0., 1.)
-
-        # Callables
-        sample_vals, = distr.sample()
-        prob = distr.prob(sample_vals)
-        log_prob = distr.log_prob(sample_vals)
-
-        # Dims
-        self.assertEqual(len(sample_vals.shape), 2)
-        self.assertEqual(sample_vals.shape[0], BATCH_SIZE)
-        self.assertEqual(sample_vals.shape[1], n_cont_vars)
-
-        for i, attr in enumerate((prob, log_prob)):
             self.assertEqual(len(attr.shape), 1, i)
             self.assertEqual(len(attr), BATCH_SIZE, i)
 

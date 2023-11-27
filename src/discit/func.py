@@ -31,43 +31,17 @@ class TaLU(torch.autograd.Function):
         return x
 
 
-class GradDiscretise(torch.autograd.Function):
-    """
-    Output one hot samples instead of probabilities, but pass gradients
-    through the latter.
-    """
+class GradScaler(torch.autograd.Function):
+    """Multiply gradients with the given factor."""
 
     @staticmethod
-    def forward(probs: Tensor, one_hots: Tensor) -> Tensor:
-        return one_hots
+    def forward(x: Tensor, factor: 'Tensor | float') -> Tensor:
+        return x
 
     @staticmethod
-    def setup_context(ctx, inputs: 'tuple[Tensor, Tensor]', output: Tensor):
-        ctx.save_for_backward(inputs[1])
+    def setup_context(ctx, inputs: 'tuple[Tensor, Tensor | float]', output: Tensor):
+        ctx.factor = inputs[1]
 
     @staticmethod
     def backward(ctx, grad: Tensor) -> 'tuple[Tensor, None]':
-        one_hots, = ctx.saved_tensors
-
-        return grad * one_hots, None
-
-
-class WeightedGradDiscretise(torch.autograd.Function):
-    """
-    Output one hot samples instead of probabilities, but pass gradients
-    through the latter, weighted by importance.
-    """
-
-    @staticmethod
-    def forward(probs: Tensor, one_hots: Tensor) -> Tensor:
-        return one_hots
-
-    @staticmethod
-    def setup_context(ctx, inputs: 'tuple[Tensor, Tensor]', output: Tensor):
-        ctx.save_for_backward(*inputs)
-
-    @staticmethod
-    def backward(ctx, grad: Tensor) -> 'tuple[Tensor, None]':
-        probs, one_hots = ctx.saved_tensors
-
-        return grad * (probs * one_hots), None
+        return grad * ctx.factor, None
