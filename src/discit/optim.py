@@ -182,7 +182,7 @@ class AnnealingScheduler(LRScheduler):
                 param_group['beta1_next'].fill_(beta1_next)
 
     def get_ratio(self, num: int, den: int) -> float:
-        ratio = max(0., min(1., num / den))
+        ratio = max(0., min(1., num / max(1, den)))
 
         if self.cosine:
             ratio = (1. - cos(pi * ratio)) / 2.

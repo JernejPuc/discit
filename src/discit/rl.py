@@ -35,6 +35,9 @@ class ActorCritic(Module, ABC):
     def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> Distribution:
         ...
 
+    def unwrap_sample(self, sample: 'tuple[Tensor, ...]') -> 'tuple[Tensor, ...]':
+        return sample[0],
+
     @abstractmethod
     def act(
         self,
@@ -298,7 +301,7 @@ class PPG:
                 act_sample = act.sample()
 
                 # Step env.
-                obs, rew, rst, *val_aux, info = self.env_step(act_sample[0])
+                obs, rew, rst, *val_aux, info = self.env_step(*self.model.unwrap_sample(act_sample))
                 nonrst = 1. - rst
 
                 # Placeholder and aux
