@@ -14,7 +14,7 @@ class NAdamW(Optimizer):
         self,
         params,
         lr: float = 1e-4,
-        betas: 'tuple[float, float, float]' = (0.9, 0.9, 0.98),
+        betas: 'tuple[float, float, float]' = (0.9, 0.9, 0.99),
         beta_products: 'tuple[float, float]' = (1., 1.),
         eps: float = 1e-6,
         weight_decay: float = 1e-2,
@@ -480,3 +480,39 @@ class AdaptivePlateauScheduler(AnnealingScheduler):
         self.val_target = (val_min + val_max) / 2.
 
         return val_min, val_max, beta1, beta1_next
+
+
+class CoeffScheduler:
+    step_ctr: int
+
+    def __init__(
+        self,
+        step_total: int,
+        val_milestones: 'tuple[float, float]',
+        cosine: bool = True,
+        starting_step: int = 0,
+        device: 'str | torch.device' = 'cuda'
+    ):
+        self.step_total = step_total
+        self.start_value, self.end_value = val_milestones
+        self.cosine = cosine
+
+        self.value = torch.tensor(self.start_value, dtype=torch.float32, device=device)
+        self.reset(starting_step)
+
+    def reset(self, starting_step: int = 0):
+        self.step_ctr = starting_step
+        self.update_value()
+
+    def step(self, increment: int = 1):
+        self.step_ctr += increment
+        self.update_value()
+
+    def update_value(self):
+        ratio = min(1., self.step_ctr / max(1, self.step_total))
+
+        if self.cosine:
+            ratio = (1. - cos(pi * ratio)) / 2.
+
+        with torch.no_grad():
+            self.value.copy_(self.start_value + (self.end_value - self.start_value) * ratio)

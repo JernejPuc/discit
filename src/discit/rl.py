@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .accel import capture_graph
 from .data import ExperienceBuffer, TensorDict
 from .distr import Distribution
-from .optim import LRScheduler
+from .optim import CoeffScheduler, LRScheduler
 from .track import CheckpointTracker
 
 
@@ -86,6 +86,7 @@ class PPG:
         n_truncated_steps: int = 16,
         batch_size: int = 256,
         n_minibatches: int = 1,
+        n_aux_minibatches: int = None,
         n_main_iters: int = 8,
         n_aux_iters: int = 6,
         discount_factor: float = 0.99,
@@ -93,7 +94,7 @@ class PPG:
         clip_ratio: float = 0.2,
         value_weight: float = 0.5,
         aux_weight: float = 0.,
-        entropy_weight: float = 3e-4,
+        entropy_weight: 'float | CoeffScheduler' = 1e-3,
         log_dir: str = 'runs',
         accelerate: bool = True,
         replay_rollout: bool = True,
@@ -129,7 +130,8 @@ class PPG:
         self.n_truncated_steps = n_truncated_steps
         self.batch_size = batch_size
         self.n_minibatches = n_minibatches
-        self.resize_batches = abs(n_minibatches) > 2
+        self.n_aux_minibatches = n_minibatches if n_aux_minibatches is None else n_aux_minibatches
+        self.resize_batches = max(abs(n_minibatches), abs(n_aux_minibatches)) > 2
         self.shuffle_rng = self.ckpter.rng if self.resize_batches and n_minibatches > 0 else None
 
         self.n_main_iters = n_main_iters
@@ -139,7 +141,14 @@ class PPG:
         self.clip_ratio = clip_ratio
         self.value_weight = value_weight
         self.aux_weight = aux_weight
-        self.entropy_weight = entropy_weight
+
+        if isinstance(entropy_weight, CoeffScheduler):
+            self.entropy_scheduler = entropy_weight
+            self.entropy_weight = self.entropy_scheduler.value
+
+        else:
+            self.entropy_scheduler = None
+            self.entropy_weight = entropy_weight
 
         self.main_buffer = ExperienceBuffer(n_rollout_steps)
         self.aux_buffer = ExperienceBuffer(n_rollout_steps * n_main_iters)
@@ -212,7 +221,7 @@ class PPG:
 
             # Aux phase
             if self.resize_batches and not self.update_returns:
-                self.aux_buffer = self.aux_buffer.restack(self.n_minibatches, self.shuffle_rng)
+                self.aux_buffer = self.aux_buffer.restack(self.n_aux_minibatches, self.shuffle_rng)
 
             for i in range(1, self.n_aux_iters+1):
                 self.print_progress(progress, remaining_time, epoch_step, i, False)
@@ -221,7 +230,7 @@ class PPG:
                     self.recollect(obs, i == 1)
 
                     if self.resize_batches:
-                        self.aux_buffer = self.aux_buffer.restack(self.n_minibatches, self.shuffle_rng)
+                        self.aux_buffer = self.aux_buffer.restack(self.n_aux_minibatches, self.shuffle_rng)
 
                 updated_mem = self.update_aux()
 
@@ -417,6 +426,9 @@ class PPG:
             self.scheduler.step(self.ratio_diff.item() / self.n_truncated_steps)
             self.lr += self.scheduler.lr
 
+            if self.entropy_scheduler is not None:
+                self.entropy_scheduler.step()
+
         # Update print-out info
         score = self.stats.get('Env/score')
 
@@ -438,7 +450,7 @@ class PPG:
 
             act: Distribution
             val: Distribution
-            aux: 'tuple[Distribution]'
+            aux: 'list[Distribution]'
 
             mem = self.model.reset_mem(mem, batch['rst'])
 
@@ -447,9 +459,6 @@ class PPG:
 
             act_log_prob = act.log_prob(*batch['sample'])
             old_act_log_prob = old_act.log_prob(*batch['sample'])
-
-            # Bound ratio to [0.05, 20] for stability
-            old_act_log_prob = old_act_log_prob.clamp(act_log_prob-3., act_log_prob+3.)
 
             ratio = (act_log_prob - old_act_log_prob).exp()
 
@@ -613,6 +622,11 @@ class PPG:
             self.scheduler.step()
             self.lr += self.scheduler.lr
 
+            # TODO: Updating entropy coeff. in aux. phase has no immediate effect
+            # Done only to avoid mismatch between LR and entropy scheduler args.
+            if self.entropy_scheduler is not None:
+                self.entropy_scheduler.step()
+
         # Update print-out info
         self.score = self.stats.get('Env/score', self.reward).item() / (self.n_rollout_steps * self.n_main_iters)
 
@@ -628,7 +642,7 @@ class PPG:
 
             act: Distribution
             val: Distribution
-            aux: 'tuple[Distribution]'
+            aux: 'list[Distribution]'
 
             mem = self.model.reset_mem(mem, batch['rst'])
 

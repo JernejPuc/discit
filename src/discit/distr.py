@@ -238,19 +238,23 @@ class MultiCategorical(Distribution):
     def kl_div(self, other: 'MultiCategorical') -> Tensor:
         return torch.stack([sd.kl_div(od) for sd, od in zip(self.distrs, other.distrs)]).sum(0)
 
-    def log_prob(self, _values: Tensor, index_stack: Tensor) -> Tensor:
+    def log_prob(self, _values: Tensor, indices: Tensor) -> Tensor:
+        index_stack = indices.transpose(0, 1).unsqueeze(-1)
+
         return torch.stack([d.log_prob(None, indices) for d, indices in zip(self.distrs, index_stack)]).sum(0)
 
-    def prob(self, _values: Tensor, index_stack: Tensor) -> Tensor:
+    def prob(self, _values: Tensor, indices: Tensor) -> Tensor:
+        index_stack = indices.transpose(0, 1).unsqueeze(-1)
+
         return torch.stack([d.prob(None, indices) for d, indices in zip(self.distrs, index_stack)]).sum(0)
 
     def sample(self) -> 'tuple[Tensor, Tensor]':
         samples = [d.sample() for d in self.distrs]
 
         values = torch.cat([sample[0] for sample in samples], dim=-1)
-        index_stack = torch.stack([sample[1] for sample in samples])
+        indices = torch.cat([sample[1] for sample in samples], dim=-1)
 
-        return values, index_stack
+        return values, indices
 
 
 class MultiNormal(Continuous):
