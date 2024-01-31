@@ -4,7 +4,7 @@ from torch import nn, Tensor
 from discit.accel import capture_graph
 from discit.distr import MultiNormal, FixedVarNormal
 from discit.func import symexp
-from discit.optim import NAdamW, AdaptivePlateauScheduler
+from discit.optim import NAdamW, AnnealingScheduler
 from discit.rl import ActorCritic, PPG
 from discit.track import CheckpointTracker
 
@@ -208,14 +208,13 @@ class CartpoleModel(ActorCritic):
     def reset_mem(
         self,
         mem: 'tuple[Tensor]',
-        reset_mask: Tensor
+        nonreset_mask: Tensor
     ) -> 'tuple[Tensor]':
 
-        reset_mask = reset_mask.unsqueeze(-1)
         memp, memv = mem
 
-        memp = torch.lerp(memp, self.memp, reset_mask)
-        memv = torch.lerp(memv, self.memv, reset_mask)
+        memp = torch.lerp(self.memp, memp, nonreset_mask)
+        memv = torch.lerp(self.memv, memv, nonreset_mask)
 
         return memp, memv
 
@@ -258,7 +257,7 @@ class CartpoleModel(ActorCritic):
         with torch.no_grad():
             x, v, memp, memv = self.fwd_partial(obs_vec, obs_aux, memp, memv, detach=False)
 
-            val_mean = FixedVarNormal(symexp(v)).mean.flatten()
+            val_mean = FixedVarNormal(symexp(v)).mean
 
         return x, val_mean, memp, memv
 
@@ -318,16 +317,16 @@ if __name__ == '__main__':
 
     # Init model
     model = CartpoleModel()
-    optimiser = NAdamW(model.parameters(), lr=2e-5, weight_decay=0., clip_grad_value=None)
+    optimizer = NAdamW(model.parameters(), lr=5e-4, weight_decay=0., clip_grad_value=None)
 
-    scheduler = AdaptivePlateauScheduler(
-        optimiser,
+    scheduler = AnnealingScheduler(
+        optimizer,
         step_milestones=[ep * n_updates_per_epoch for ep in epoch_milestones],
         starting_step=ckpter.meta['update_step'])
 
     # Load last weights
     model.to(ckpter.device)
-    ckpter.load_model(model, optimiser)
+    ckpter.load_model(model, optimizer)
 
     # Accelerate env. step
     accelerate = True

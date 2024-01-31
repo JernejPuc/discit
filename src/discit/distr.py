@@ -6,7 +6,7 @@ from typing import Callable
 
 import torch
 from torch import Tensor
-from torch.nn.functional import logsigmoid, log_softmax
+from torch.nn.functional import log_softmax, softplus
 
 
 class Distribution:
@@ -17,10 +17,10 @@ class Distribution:
     dev: Tensor
     var: Tensor
     entropy: Tensor
-    kl_div: 'Callable[[Distribution], Tensor]'
-    log_prob: 'Callable[[Tensor, ...], Tensor]'
-    prob: 'Callable[[Tensor, ...], Tensor]'
-    sample: 'Callable[[], tuple[Tensor, ...]]'
+    kl_div: Callable[['Distribution'], Tensor]
+    log_prob: Callable[[Tensor], Tensor]
+    prob: Callable[[Tensor], Tensor]
+    sample: Callable[[], 'tuple[Tensor, ...]']
 
 
 class Continuous(Distribution):
@@ -289,13 +289,12 @@ class MultiNormal(Continuous):
         if log_dev_bias:
             pseudo_log_dev = pseudo_log_dev + log_dev_bias
 
-        if dev_bias:
-            dev = pseudo_log_dev.sigmoid() + dev_bias
-            log_dev = dev.log()
+        dev = softplus(pseudo_log_dev)
 
-        else:
-            dev = pseudo_log_dev.sigmoid()
-            log_dev = logsigmoid(pseudo_log_dev)
+        if dev_bias:
+            dev = dev + dev_bias
+
+        log_dev = dev.log()
 
         return cls(mean, log_dev, dev)
 

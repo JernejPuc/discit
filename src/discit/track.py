@@ -44,7 +44,7 @@ class CheckpointTracker:
         self.resume(initial_seed, transfer_name, ver_to_transfer, reset_step_on_transfer)
 
         self.model: 'Module | None' = None
-        self.optimiser: 'Optimizer | None' = None
+        self.optimizer: 'Optimizer | None' = None
 
     def resume(self, seed: int, transfer_name: str, ver_to_transfer: int, reset_step_on_transfer: bool):
         """Initialise the first or load the last checkpoint data of the current model."""
@@ -168,7 +168,7 @@ class CheckpointTracker:
             torch.save(model_state, self.meta['model_path'])
 
         # Save full checkpoint
-        optim_state = None if self.optimiser is None else self.optimiser.state_dict()
+        optim_state = None if self.optimizer is None else self.optimizer.state_dict()
 
         torch.save(
             {
@@ -187,11 +187,11 @@ class CheckpointTracker:
 
         print(f'\n{log_text}')
 
-    def load_model(self, model: Module, optimiser: Optimizer = None):
-        """Restore model and optimiser params."""
+    def load_model(self, model: Module, optimizer: Optimizer = None):
+        """Restore model and optimizer params."""
 
         self.model = model.to(self.device)
-        self.optimiser = optimiser
+        self.optimizer = optimizer
 
         if path_exists := os.path.exists(path := self.meta['ckpt_path']):
             ckpt = torch.load(path, map_location=self.device)
@@ -199,7 +199,11 @@ class CheckpointTracker:
             if (state := ckpt['model']) is not None:
                 model.load_state_dict(state)
 
-            if optimiser is not None and (state := ckpt['optim']) is not None:
-                optimiser.load_state_dict(state)
+            if optimizer is not None and (state := ckpt['optim']) is not None:
+                optimizer.load_state_dict(state)
 
-        print(f'{"Loaded" if path_exists else "Initialised"} model ver. {self.meta["ckpt_ver"]}.')
+        log_text = f'{"Loaded" if path_exists else "Initialised"} model ver. {self.meta["ckpt_ver"]}.'
+
+        self.logger.info(log_text)
+
+        print(log_text)

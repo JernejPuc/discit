@@ -500,15 +500,16 @@ class ExperienceBuffer:
             raise RuntimeError('Need full buffer to label.')
 
         advantages = torch.zeros_like(values)
+        gamma_lambda = gamma * lam
 
         # NOTE: Final values (future returns) in an episode are assumed to be zeros
         # Earlier returns are based (bootstrapped) on the model's estimates
         for batch in reversed(self.batches):
             deltas = batch['rew'] + batch['nonrst'] * gamma * values - batch['val']
-            advantages = deltas + batch['nonrst'] * (gamma * lam) * advantages
+            advantages = batch['imp'] * deltas + batch['nonrst'] * gamma_lambda * advantages
             values = batch['val']
 
-            batch['adv'] = advantages
+            batch['adv'] = advantages.sum(-1)
             batch['ret'] = (advantages + values, *batch['ret'][1:])
 
         if skip_std:
