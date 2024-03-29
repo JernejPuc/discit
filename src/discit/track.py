@@ -49,26 +49,26 @@ class CheckpointTracker:
     def resume(self, seed: int, transfer_name: str, ver_to_transfer: int, reset_step_on_transfer: bool):
         """Initialise the first or load the last checkpoint data of the current model."""
 
-        # Load or create meta.json file
-        if os.path.exists(path := os.path.join(self.data_dir, 'meta.json')):
+        # Start from existing files
+        if transfer_name and os.path.exists(
+            path := os.path.join(os.path.dirname(self.data_dir), transfer_name, 'meta.json')
+        ):
             with open(path, 'r') as meta_file:
                 meta_data: 'dict[str, Any]' = json.load(meta_file)
 
         else:
+            meta_data = None
+
+        # Load or create meta.json file
+        if not os.path.exists(path := os.path.join(self.data_dir, 'meta.json')):
             os.makedirs(self.data_dir, exist_ok=True)
 
             with open(path, 'w') as meta_file:
                 json.dump({}, meta_file)
 
-            # Start from existing files
-            if transfer_name and os.path.exists(
-                path := os.path.join(os.path.dirname(self.data_dir), transfer_name, 'meta.json')
-            ):
-                with open(path, 'r') as meta_file:
-                    meta_data: 'dict[str, Any]' = json.load(meta_file)
-
-            else:
-                meta_data = None
+        elif meta_data is None:
+            with open(path, 'r') as meta_file:
+                meta_data: 'dict[str, Any]' = json.load(meta_file)
 
         # Init. logger
         log_handler = logging.FileHandler(self.log_path)
@@ -81,23 +81,30 @@ class CheckpointTracker:
 
         # Load or create initial meta data
         if meta_data:
-            self.meta = meta_data[sorted(meta_data.keys())[-1]]
+            self.meta = meta_data[max(meta_data.keys())]
 
             if transfer_name:
-                self.logger.info(f'Starting from model {transfer_name} ver. {ver_to_transfer}.')
-
-                self.meta['name'] = self.model_name
-
                 if ver_to_transfer is not None:
+                    meta_data = {k: v for k, v in meta_data.items() if v['ckpt_ver'] == ver_to_transfer}
+                    self.meta = meta_data[max(meta_data.keys())]
+
                     transfer_dir = os.path.join(os.path.dirname(self.data_dir), transfer_name)
 
                     self.meta['ckpt_ver'] = ver_to_transfer
                     self.meta['model_path'] = os.path.join(transfer_dir, f'model_{ver_to_transfer:03d}.pt')
                     self.meta['ckpt_path'] = os.path.join(transfer_dir, f'ckpt_{ver_to_transfer:03d}.pt')
 
+                self.meta['name'] = self.model_name
+
                 if reset_step_on_transfer:
                     self.meta['epoch_step'] = 0
                     self.meta['update_step'] = 0
+
+                log_text = f'Starting from model {transfer_name} ver. {ver_to_transfer}.'
+
+                self.logger.info(log_text)
+
+                print(log_text)
 
         else:
             self.meta = {'ckpt_ctr': -1, 'ckpt_ver': 0, 'name': self.model_name}
