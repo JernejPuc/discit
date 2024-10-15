@@ -26,7 +26,8 @@ class CheckpointTracker:
         transfer_name: str = '',
         ver_to_transfer: int = None,
         reset_step_on_transfer: bool = False,
-        deterministic: bool = False
+        deterministic: bool = False,
+        debug: bool = False
     ):
         if deterministic:
             # See: https://github.com/pytorch/pytorch/issues/76176
@@ -35,6 +36,10 @@ class CheckpointTracker:
             os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
             torch.backends.cudnn.benchmark = False
             torch.use_deterministic_algorithms(True)
+
+        if debug:
+            os.environ['CUDA_LAUNCH_BLOCKING'] = 1
+            torch.autograd.set_detect_anomaly(True)
 
         self.model_name = model_name
         self.data_dir = os.path.join(data_dir, model_name)

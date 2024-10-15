@@ -2,16 +2,16 @@ import os
 from setuptools import setup
 
 
-with open(os.path.join(os.path.dirname(__file__), 'README.md'), 'r') as readme_file:
-    readme = readme_file.read()
+with open(os.path.join(os.path.dirname(__file__), 'README.md'), 'r') as f:
+    readme = f.read()
 
-with open(os.path.join(os.path.dirname(__file__), 'requirements.txt'), 'r') as req_file:
-    requirements = req_file.read().splitlines()
+with open(os.path.join(os.path.dirname(__file__), 'requirements.txt'), 'r') as f:
+    requirements = f.read().splitlines()
 
 setup(
     name='discit',
-    version='0.1.9',
-    description='Discit: Deep learning tools',
+    version='0.2.0',
+    description='Discit: Deep Learning Tools',
     long_description=readme,
     long_description_content_type='text/markdown',
     url='https://github.com/jernejpuc/discit',
@@ -27,7 +27,10 @@ setup(
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
         'Operating System :: POSIX :: Linux',
         'Programming Language :: Python :: 3 :: Only',
-        'Programming Language :: Python :: 3.8'],
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11'],
     platforms=['Linux'],
     packages=['discit'],
     package_dir={'': 'src'},
