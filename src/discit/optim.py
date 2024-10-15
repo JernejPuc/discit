@@ -113,6 +113,28 @@ class NAdamW(Optimizer):
                 param.addcdiv_(exp_avg * momentum_step, denom)                  # value
 
 
+class MultiOptimizer:
+    """Wrapper to step multiple optimizers together."""
+
+    def __init__(self, **optimizers: Optimizer):
+        self.optimizers = optimizers
+
+    def zero_grad(self):
+        for optimizer in self.optimizers.values():
+            optimizer.zero_grad()
+
+    def step(self):
+        for optimizer in self.optimizers.values():
+            optimizer.step()
+
+    def state_dict(self) -> 'dict[str, dict[str, Any]]':
+        return {key: optimizer.state_dict() for key, optimizer in self.optimizers.items()}
+
+    def load_state_dict(self, state_dicts: 'dict[str, dict[str, Any]]'):
+        for key, state_dict in state_dicts:
+            self.optimizers[key].load_state_dict(state_dict)
+
+
 class LRScheduler:
     """Constant learning rate scheduler that only increments the step counter."""
 
@@ -120,6 +142,7 @@ class LRScheduler:
     lrs: 'list[float]'
     lr: float
     step_ctr: int
+    value = float('nan')
 
     def __init__(self, optimizer: Optimizer, starting_step: int = 0):
         self.optimizer = optimizer
@@ -387,7 +410,7 @@ class CoeffScheduler:
         self.step_ctr = starting_step
         self.update_value()
 
-    def step(self, increment: int = 1):
+    def step(self, _metrics: Any = None, increment: int = 1):
         self.step_ctr += increment
         self.update_value()
 
@@ -399,3 +422,65 @@ class CoeffScheduler:
 
         with torch.no_grad():
             self.value.fill_(self.start_value + (self.end_value - self.start_value) * ratio)
+
+    def update_args(self, **args):
+        pass
+
+    def state_dict(self) -> 'dict[str, Any]':
+        return self.__dict__
+
+    def load_state_dict(self, state_dict: 'dict[str, Any]'):
+        self.__dict__.update(state_dict)
+
+
+class MultiScheduler:
+    """Wrapper to step multiple schedulers together."""
+
+    step_ctr: int
+
+    def __init__(self, **schedulers: 'LRScheduler | CoeffScheduler'):
+        self.schedulers = schedulers
+        self.step_ctr = max(scheduler.step_ctr for scheduler in self.schedulers.values())
+
+    @property
+    def lr(self) -> float:
+        lrs = [scheduler.lr for scheduler in self.schedulers.values() if isinstance(scheduler, LRScheduler)]
+
+        if not lrs:
+            return float('nan')
+
+        return sum(lrs) / len(lrs)
+
+    @property
+    def value(self) -> float:
+        vals = [scheduler.value for scheduler in self.schedulers.values() if isinstance(scheduler, CoeffScheduler)]
+
+        if not vals:
+            return float('nan')
+
+        return sum(vals) / len(vals)
+
+    def reset(self, starting_step: int = 0):
+        for scheduler in self.schedulers.values():
+            scheduler.reset(starting_step)
+
+        self.step_ctr = max(scheduler.step_ctr for scheduler in self.schedulers.values())
+
+    def step(self, metrics: Any = None, increment: int = 1):
+        self.step_ctr += increment
+
+        for scheduler in self.schedulers.values():
+            scheduler.step(metrics, increment)
+
+    def update_args(self, **shared_args: 'dict[str, float]'):
+        for scheduler in self.schedulers.values():
+            scheduler.update_args(**shared_args)
+
+    def state_dict(self) -> 'dict[str, dict[str, Any]]':
+        return {key: scheduler.state_dict() for key, scheduler in self.schedulers.items()}
+
+    def load_state_dict(self, state_dicts: 'dict[str, dict[str, Any]]'):
+        for key, state_dict in state_dicts.items():
+            self.schedulers[key].load_state_dict(state_dict)
+
+        self.step_ctr = max(scheduler.step_ctr for scheduler in self.schedulers.values())
