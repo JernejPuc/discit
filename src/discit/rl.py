@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from datetime import timedelta
 from io import BytesIO
 from time import perf_counter
-from typing import Any, Callable
+from typing import Callable
 
 import torch
 from torch import cuda, Tensor
@@ -24,7 +24,7 @@ class ActorCritic(Module, ABC):
         Module.__init__(self)
 
     @abstractmethod
-    def init_mem(self, batch_size: int) -> 'tuple[Tensor, ...]':
+    def init_mem(self, n_actors: int) -> 'tuple[Tensor, ...]':
         ...
 
     @abstractmethod
@@ -35,17 +35,8 @@ class ActorCritic(Module, ABC):
     def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> Distribution:
         ...
 
-    def unwrap_sample(self, sample: 'tuple[Tensor, ...]') -> 'tuple[Tensor, ...]':
-        return sample[0],
-
-    @abstractmethod
-    def act(
-        self,
-        obs: 'tuple[Tensor, ...]',
-        mem: 'tuple[Tensor, ...]',
-        sample: bool
-    ) -> 'tuple[tuple[Tensor, ...], tuple[Tensor, ...]]':
-        ...
+    def unwrap_sample(self, sample: 'tuple[Tensor, ...]', aux: 'tuple[Tensor, ...]') -> 'tuple[Tensor | None, ...]':
+        return sample[0], None
 
     @abstractmethod
     def collect(
@@ -53,7 +44,7 @@ class ActorCritic(Module, ABC):
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
         encode: bool
-    ) -> 'tuple[Tensor, Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
+    ) -> 'tuple[Tensor, Tensor, Tensor | None, tuple[Tensor, ...], tuple[Tensor, ...]]':
         ...
 
     @abstractmethod
@@ -62,7 +53,7 @@ class ActorCritic(Module, ABC):
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
         detach: bool
-    ) -> 'tuple[Distribution, Distribution, tuple[Tensor, ...]]':
+    ) -> 'tuple[Distribution, Distribution, tuple[Distribution], tuple[Tensor, ...]]':
         ...
 
 
@@ -94,8 +85,8 @@ class PPG:
     def __init__(
         self,
         env_step: Callable[
-            ['Tensor | None'],
-            'tuple[tuple[Tensor, ...], Tensor, Tensor, dict[str, Any]]'],
+            ['Tensor | None', 'Tensor | None'],
+            'tuple[tuple[Tensor, ...], Tensor, Tensor, dict[str, float]]'],
         ckpt_tracker: CheckpointTracker,
         scheduler: LRScheduler,
         n_actors: int,
@@ -347,29 +338,28 @@ class PPG:
             for _ in range(self.n_rollout_steps):
 
                 # Step actor
-                act_out, val_mean, obs_enc, new_mem = self.model.collect(obs, mem, encode=True)
+                act_out, val_mean, aux_belief, obs_enc, new_mem = self.model.collect(obs, mem, encode=True)
 
                 act = self.model.get_distr(act_out, from_raw=True)
                 act_sample = act.sample()
 
                 # Step env.
-                obs, rew, rst, *val_aux, info = self.env_step(*self.model.unwrap_sample(act_sample))
+                obs, rew, rst, *val_aux, info = self.env_step(*self.model.unwrap_sample(act_sample, aux_belief))
                 nonrst = 1. - rst
-
-                # Placeholder and aux
-                ret = (val_mean, *val_aux)
 
                 # Add batch to buffers
                 d = TensorDict({
-                    'sample': act_sample,
-                    'act': act.args,
+                    'act': act_sample,
+                    'args': act.args,
                     'val': val_mean,
                     'obs': obs_enc,
                     'mem': mem,
-                    'rew': rew,
-                    'ret': ret,
+                    'rwd': rew,
                     'imp': self.init_imp_weight,
-                    'nonrst': nonrst})
+                    'nrst': nonrst})
+
+                if val_aux:
+                    d['vaux'] = tuple(val_aux)
 
                 self.main_buffer.append(d)
                 self.aux_buffer.append(d)
@@ -410,13 +400,13 @@ class PPG:
             for b in buffer.batches:
 
                 # Step actor
-                act_out, val_mean, _, new_mem = self.model.collect(b['obs'], mem, encode=False)
+                act_out, val_mean, _, _, new_mem = self.model.collect(b['obs'], mem, encode=False)
 
                 # Update batch
                 if self.in_main_phase or update_act:
                     act = self.model.get_distr(act_out, from_raw=True)
-                    old_act = self.model.get_distr(b['act'], from_raw=False)
-                    clipped_imp = (act.log_prob(*b['sample']) - old_act.log_prob(*b['sample'])).clamp(None, 0.).exp()
+                    old_act = self.model.get_distr(b['args'], from_raw=False)
+                    clipped_imp = (act.log_prob(*b['act']) - old_act.log_prob(*b['act'])).clamp(None, 0.).exp()
 
                     b['imp'] = clipped_imp.unsqueeze(-1)
 
@@ -429,8 +419,8 @@ class PPG:
                 # Reset memory if any terminal states are reached
                 mem = new_mem
 
-                if not b['nonrst'].all():
-                    mem = self.model.reset_mem(mem, b['nonrst'])
+                if not b['nrst'].all():
+                    mem = self.model.reset_mem(mem, b['nrst'])
 
             # Perform an additional critic pass to get the final values used in GAE
             _, values, _, _ = self.model.collect(final_obs, mem, encode=True)
@@ -493,19 +483,18 @@ class PPG:
 
         for batch in batches:
             act, val, *aux, mem = self.model(batch['obs'], mem, detach=self.detach_critic)
-            ret, *ref_aux = batch['ret']
 
             act: Distribution
             val: Distribution
             aux: 'list[Distribution]'
 
-            mem = self.model.reset_mem(mem, batch['nonrst'])
+            mem = self.model.reset_mem(mem, batch['nrst'])
 
             # Policy
-            old_act: Distribution = self.model.get_distr(batch['act'], from_raw=False)
+            old_act: Distribution = self.model.get_distr(batch['args'], from_raw=False)
 
-            act_log_prob = act.log_prob(*batch['sample'])
-            old_act_log_prob = old_act.log_prob(*batch['sample'])
+            act_log_prob = act.log_prob(*batch['act'])
+            old_act_log_prob = old_act.log_prob(*batch['act'])
 
             ratio = (act_log_prob - old_act_log_prob).exp()
 
@@ -515,13 +504,14 @@ class PPG:
 
             # Value
             # NOTE: No value loss clipping
-            value_loss = val.log_prob(ret).mean()
+            value_loss = val.log_prob(batch['ret']).mean()
 
             # Auxiliary
             aux_loss = 0.
 
-            for aux_i, ref_aux_i in zip(aux, ref_aux):
-                aux_loss = aux_loss + aux_i.log_prob(ref_aux_i).mean()
+            if 'vaux' in batch:
+                for aux_i, ref_aux_i in zip(aux, batch['vaux']):
+                    aux_loss = aux_loss + aux_i.log_prob(ref_aux_i).mean()
 
             # Entropy
             entropy = act.entropy.mean()
@@ -676,28 +666,28 @@ class PPG:
 
         for batch in batches:
             act, val, *aux, mem = self.model(batch['obs'], mem, detach=False)
-            ret, *ref_aux = batch['ret']
 
             act: Distribution
             val: Distribution
             aux: 'list[Distribution]'
 
-            mem = self.model.reset_mem(mem, batch['nonrst'])
+            mem = self.model.reset_mem(mem, batch['nrst'])
 
             # KL divergence
-            old_act: Distribution = self.model.get_distr(batch['act'], from_raw=False)
+            old_act: Distribution = self.model.get_distr(batch['args'], from_raw=False)
 
             kl_div = old_act.kl_div(act).mean()
 
             # Value
             # NOTE: No value loss clipping
-            value_loss = val.log_prob(ret).mean()
+            value_loss = val.log_prob(batch['ret']).mean()
 
             # Auxiliary
             aux_loss = 0.
 
-            for aux_i, ref_aux_i in zip(aux, ref_aux):
-                aux_loss = aux_loss + aux_i.log_prob(ref_aux_i).mean()
+            if 'vaux' in batch:
+                for aux_i, ref_aux_i in zip(aux, batch['vaux']):
+                    aux_loss = aux_loss + aux_i.log_prob(ref_aux_i).mean()
 
             # Total
             full_loss = self.value_weight * value_loss + self.aux_weight * aux_loss + kl_div

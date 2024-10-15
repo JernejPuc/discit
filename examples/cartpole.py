@@ -105,7 +105,7 @@ class CartpoleEnv:
 
         return rew_vel.mul_(rew_ang_vel).mul_(rew_ang)
 
-    def step(self, action: Tensor = None) -> 'tuple[tuple[Tensor, ...], Tensor, Tensor, dict]':
+    def step(self, action: Tensor = None, belief: Tensor = None) -> 'tuple[tuple[Tensor, ...], Tensor, Tensor, dict]':
         if action is None:
             return self.get_observation(), None, None, self.NULL_DICT
 
@@ -272,7 +272,7 @@ class CartpoleModel(ActorCritic):
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
         encode: bool
-    ) -> 'tuple[Tensor, Tensor, tuple[Tensor, ...], tuple[Tensor, ...]]':
+    ) -> 'tuple[Tensor, Tensor, None, tuple[Tensor, ...], tuple[Tensor, ...]]':
 
         if encode:
             x, val_mean, memp, memv = self.collect_static(*obs, *mem)
@@ -281,7 +281,7 @@ class CartpoleModel(ActorCritic):
         else:
             x, val_mean, memp, memv = self.collect_copied(*obs, *mem)
 
-        return x, val_mean, obs, (memp, memv)
+        return x, val_mean, None, obs, (memp, memv)
 
     def forward(
         self,
