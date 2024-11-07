@@ -254,7 +254,7 @@ class ExperienceBuffer:
             self.batches, self.bind_ptr = data
 
     def clear(self, n_clear: int = None):
-        if n_clear is None or n_clear >= self.bind_ptr:
+        if n_clear is None or n_clear >= self.buffer_len:
             self.batches.clear()
 
         elif n_clear == 0:
@@ -389,13 +389,13 @@ class ExperienceBuffer:
         n_out_chunks: int = 1
     ) -> 'ExperienceBuffer':
 
-        if self.bind_ptr < seq_length or self.bind_ptr % seq_length:
+        if self.bind_ptr < seq_length:
             raise RuntimeError(f'Seq. length {seq_length} incompatible with {self.bind_ptr} batches in buffer.')
 
         # List of sequences of sliced batches
         seq_list = [
             [b.chunk(j, n_in_chunks) for b in self.batches[i:i+seq_length]]
-            for i in range(0, self.bind_ptr, seq_length)
+            for i in range(0, self.bind_ptr - self.bind_ptr % seq_length, seq_length)
             for j in range(n_in_chunks)]
 
         # Reorder sequences uniformly
@@ -537,12 +537,12 @@ class ExperienceBuffer:
 
         advantages = torch.stack([batch['adv'] for batch in self.batches], dim=1)
 
-        # NOTE: Standardisation works best over the whole rollout (more samples, fewer outliers)
-        # NOTE: Div. by scale is clipped to limit the noise of sparse rewards (max. 20x larger)
+        # NOTE: Standardisation works best over the whole rollout (more samples, fewer gaps)
+        # NOTE: Div. by scale is clipped to limit the magnitude of sparse rewards (max. 100x larger)
         adv_mean = advantages.mean()
         adv_std = advantages.std()
 
-        advantages = (advantages - adv_mean) / torch.clip(adv_std, 0.05)
+        advantages = (advantages - adv_mean) / adv_std.clip(0.01)
 
         for i, batch in enumerate(self.batches):
             batch['adv'] = advantages[:, i]
@@ -551,63 +551,59 @@ class ExperienceBuffer:
 
     def multilabel(
         self,
-        values: 'tuple[Tensor, Tensor]',
+        values: Tensor,
         gammas: 'float | Tensor',
-        lambdas: 'float | tuple[float, float]',
+        lambda_: float,
         n_actors_per_env: int
-    ) -> 'tuple[Tensor, Tensor, Tensor]':
+    ) -> 'tuple[Tensor, Tensor]':
         """
-        Compute advantages and returns via generalised advantage estimation (GAE)
-        with multi-agent importance weights (M-trace), dual advantage (DNA),
-        and external advantage estimates (ACPPO) and add them to existing batches.
+        Compute advantages via generalised advantage estimation (GAE)
+        and external advantage estimates (ACPPO), bootstrap returns,
+        and add them to existing batches.
         """
 
-        adv_val = torch.zeros_like(values)
+        advantages = torch.zeros_like(values)
 
-        if isinstance(lambdas, float):
-            adv_pi = adv_val
-            gl_val = gammas * lambdas
-            gl_pi = None
+        # Bootstrap returns
+        returns = values
 
-        else:
-            adv_pi = torch.zeros_like(values)
-            gl_val = gammas * lambdas[0]
-            gl_pi = gammas * lambdas[1]
+        for batch in reversed(self.batches):
+            nrst_gammas = batch['nrst'] * gammas
 
-        # Truncated at log(0) = 1
-        importances = torch.stack([batch['imp'] for batch in reversed(self.batches)])
-        importances = importances.reshape(self.bind_ptr, -1, n_actors_per_env).sum(-1).clamp_(None, 0.).exp_()
+            # Discounted sum
+            returns = batch['rwd'] + nrst_gammas * returns
 
-        imp_mean = importances.mean()
-        importances = importances.repeat_interleave(n_actors_per_env, dim=1, output_size=len(values)).unsqueeze(-1)
+            # Value targets
+            batch['retj'] = returns[::n_actors_per_env, :1]
+            batch['reti'] = returns[:, 1:]
 
-        for batch, imp in zip(reversed(self.batches), importances):
-            deltas = imp * (batch['rwd'] + batch['nrst'] * (gammas * values - batch['val']))
-
-            adv_val = deltas + batch['nrst'] * gl_val * adv_val
-            adv_pi = (deltas + batch['nrst'] * gl_pi * adv_pi) if gl_pi is not None else adv_val
-            adv_ext = imp * batch['nrst'] * batch['adv']
+            # GAE
+            deltas = batch['rwd'] + nrst_gammas * values - batch['val']
+            advantages = deltas + nrst_gammas * lambda_ * advantages
 
             values = batch['val']
-            returns = adv_val + values
 
-            batch['adv_tar'] = adv_val[::n_actors_per_env, :1]
-            batch['adv_pi'] = adv_pi.sum(-1) + adv_ext.sum(-1)
-            batch['ret_joint'] = returns[::n_actors_per_env, :1]
-            batch['ret_indiv'] = returns[:, 1:]
+            # Joint advantage targets
+            batch['advt'] = advantages[::n_actors_per_env, :1]
+
+            # Replace joint policy advantages with external advantages
+            adv_ext = batch['nrst'] * batch['advx']
+
+            batch['advp'] = adv_ext.sum(-1) + advantages[:, 1:].sum(-1)
 
         # Only force expectation of zero mean for adv. target
-        adv_tar = torch.stack([batch['adv_tar'] for batch in self.batches])
+        adv_tar = torch.stack([batch['advt'] for batch in self.batches])
         adv_tar = adv_tar - adv_tar.mean()
 
         # Standardise variance of adv. as policy loss factor
-        adv_pi = torch.stack([batch['adv_pi'] for batch in self.batches])
+        adv_pi = torch.stack([batch['advp'] for batch in self.batches])
+
         adv_mean = adv_pi.mean()
         adv_std = adv_pi.std()
-        adv_pi = (adv_pi - adv_mean) / torch.clip(adv_std, 0.05)
+        adv_pi = (adv_pi - adv_mean) / adv_std.clip(0.01)
 
         for i, batch in enumerate(self.batches):
-            batch['adv_pi'] = adv_pi[i]
-            batch['adv_tar'] = adv_tar[i]
+            batch['advp'] = adv_pi[i]
+            batch['advt'] = adv_tar[i]
 
-        return adv_mean, adv_std, imp_mean
+        return adv_mean, adv_std

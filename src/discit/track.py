@@ -38,7 +38,7 @@ class CheckpointTracker:
             torch.use_deterministic_algorithms(True)
 
         if debug:
-            os.environ['CUDA_LAUNCH_BLOCKING'] = 1
+            os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
             torch.autograd.set_detect_anomaly(True)
 
         self.model_name = model_name
@@ -50,6 +50,7 @@ class CheckpointTracker:
 
         self.model: 'Module | None' = None
         self.optimizer: 'Optimizer | None' = None
+        self.transferred = bool(transfer_name)
 
     def resume(self, seed: int, transfer_name: str, ver_to_transfer: int, reset_step_on_transfer: bool):
         """Initialise the first or load the last checkpoint data of the current model."""
@@ -211,7 +212,7 @@ class CheckpointTracker:
             if (state := ckpt['model']) is not None:
                 model.load_state_dict(state)
 
-            if optimizer is not None and (state := ckpt['optim']) is not None:
+            if not self.transferred and optimizer is not None and (state := ckpt['optim']) is not None:
                 optimizer.load_state_dict(state)
 
         log_text = f'{"Loaded" if path_exists else "Initialised"} model ver. {self.meta["ckpt_ver"]}.'

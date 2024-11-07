@@ -131,7 +131,7 @@ class MultiOptimizer:
         return {key: optimizer.state_dict() for key, optimizer in self.optimizers.items()}
 
     def load_state_dict(self, state_dicts: 'dict[str, dict[str, Any]]'):
-        for key, state_dict in state_dicts:
+        for key, state_dict in state_dicts.items():
             self.optimizers[key].load_state_dict(state_dict)
 
 

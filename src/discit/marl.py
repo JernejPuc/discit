@@ -108,8 +108,7 @@ class MAXPPO:
         'Main/entropy',
         'Main/ratio_diff',
         'GAE/adv_mean',
-        'GAE/adv_std',
-        'GAE/imp_mean')
+        'GAE/adv_std')
 
     def __init__(
         self,
@@ -130,8 +129,8 @@ class MAXPPO:
         batch_size: int = None,
         aux_task: AuxTask = None,
         discount_gammas: 'float | tuple[float, ...]' = 0.99,
-        trace_lambdas: 'float | tuple[float, float]' = 0.99,
-        clip_ratio: float = 0.2,
+        trace_lambda: float = 0.95,
+        clip_ratio: float = 0.25,
         policy_weight: float = 1.,
         value_weight: float = 0.5,
         aux_weight: float = 0.,
@@ -177,18 +176,15 @@ class MAXPPO:
             discount_gammas = torch.tensor((discount_gammas,), dtype=torch.float32, device=self.ckpter.device)
 
         self.discount_gammas = discount_gammas
-        self.trace_lambdas = trace_lambdas
+        self.trace_lambda = trace_lambda
 
-        self.clip_min = torch.tensor(1. / (1. + clip_ratio), device=self.ckpter.device)
-        self.log_clip_max = torch.tensor(1. + clip_ratio, device=self.ckpter.device).log()
+        self.improv_bounds = 1. / (1. + clip_ratio), 1. + clip_ratio
+        self.decline_bounds = 1. / (1. + 2*clip_ratio), 1. + 2*clip_ratio
 
-        self.policy_weight = -policy_weight
-        self.value_weight = -value_weight
-        self.aux_weight = -aux_weight
+        self.policy_weight = policy_weight
+        self.value_weight = value_weight
+        self.aux_weight = aux_weight
         self.entropy_weight = entropy_weight
-
-        self.init_imp_weight = torch.zeros((n_actors, 1), device=self.ckpter.device)
-        self.init_imp_max = (1. + clip_ratio) * torch.ones(n_actors, device=self.ckpter.device)
 
         self.stats = {k: torch.tensor(0., device=self.ckpter.device) for k in self.STAT_KEYS}
 
@@ -332,9 +328,6 @@ class MAXPPO:
         obs, env_data, info = self.env_step(*self.model.unwrap_sample(data['act'], aux_belief))
 
         data.update(env_data)
-        data['imp'] = self.init_imp_weight
-        data['max'] = self.init_imp_max
-
         nrst = data['nrst']
         rwd = data['rwd']
 
@@ -368,21 +361,10 @@ class MAXPPO:
         # Step actor
         data, _, mem = self.model.collect(b['obs'], mem, sample=b['act'])
 
-        # Update batch
-        act = self.model.get_distr(data['args'])
-        old_act = self.model.get_distr(b['args'])
-
-        imp = act.log_prob(*b['act']) - old_act.log_prob(*b['act'])
-        clip_max = (imp + self.log_clip_max).exp()
-
-        b['max'] = clip_max
-        b['imp'] = imp
+        # Update value estimates
         b['val'] = data['val']
 
-        # Update act. and mem. in-place, so tensors/views in aux. buffers can benefit too
-        for t, new_t in zip(b['args'], data['args']):
-            t.copy_(new_t)
-
+        # Update mem. in-place, so tensors/views in aux. buffers can benefit too
         for t, new_t in zip(b['mem'], data['mem']):
             t.copy_(new_t)
 
@@ -397,12 +379,11 @@ class MAXPPO:
         # Perform an additional critic pass to get the final values used in GAE
         values = self.model.collect(obs, mem, None)[0]['val']
 
-        adv_mean, adv_std, imp_mean = self.main_buffer.multilabel(
-            values, self.discount_gammas, self.trace_lambdas, self.n_actors_per_env)
+        adv_mean, adv_std = self.main_buffer.multilabel(
+            values, self.discount_gammas, self.trace_lambda, self.n_actors_per_env)
 
         self.stats['GAE/adv_mean'] += adv_mean
         self.stats['GAE/adv_std'] += adv_std
-        self.stats['GAE/imp_mean'] += imp_mean
 
     def update(self, batches: 'list[TensorDict]'):
         stats = self.stats
@@ -415,9 +396,9 @@ class MAXPPO:
             data = self.model(b['obs'], mem, b['act'])
 
             act: Distribution = data['act']
-            adv: Distribution = data['advj']
-            val_tot: Distribution = data['valj']
-            val_ind: Distribution = data['vali']
+            advj: Distribution = data['advj']
+            valj: Distribution = data['valj']
+            vali: Distribution = data['vali']
             aux: 'tuple[Distribution, ...]' = data['aux']
 
             mem = self.model.reset_mem(data['mem'], b['nrst'])
@@ -427,18 +408,18 @@ class MAXPPO:
             ratio = (act.log_prob(*b['act']) - old_act.log_prob(*b['act'])).exp()
 
             policy_loss = torch.minimum(
-                b['adv_pi'] * ratio,
-                b['adv_pi'] * ratio.clamp(self.clip_min, b['max'])).mean()
+                b['advp'] * ratio.clamp(*self.improv_bounds),
+                b['advp'] * ratio.clamp(*self.decline_bounds)).mean()
 
             # Value
-            target_adv_loss = adv.log_prob(b['adv_tar']).mean()
-            joint_value_loss = val_tot.log_prob(b['ret_joint']).mean()
-            indiv_value_loss = val_ind.log_prob(b['ret_indiv']).mean()
+            target_adv_loss = advj.log_prob(b['advt']).mean()
+            joint_value_loss = valj.log_prob(b['retj']).mean()
+            indiv_value_loss = vali.log_prob(b['reti']).mean()
             value_loss = target_adv_loss + joint_value_loss + indiv_value_loss
 
             # Auxiliary
             if self.aux_task and self.aux_task.online:
-                aux_loss = self.aux_task.loss(b, act, (val_tot, val_ind), aux, stats)
+                aux_loss = self.aux_task.loss(b, act, (valj, vali), aux, stats)
 
             else:
                 aux_loss = 0.
@@ -448,9 +429,9 @@ class MAXPPO:
 
             # Total
             full_loss = (
-                self.policy_weight * policy_loss
-                + self.value_weight * value_loss
-                + self.aux_weight * aux_loss
+                self.aux_weight * aux_loss
+                - self.policy_weight * policy_loss
+                - self.value_weight * value_loss
                 - self.entropy_weight * entropy)
 
             running_loss = running_loss + full_loss
@@ -459,14 +440,14 @@ class MAXPPO:
             with torch.no_grad():
                 stats['Out/act_mean'] += act.mean.mean()
                 stats['Out/act_std'] += act.dev.mean()
-                stats['Out/val_mean'] += b['val'].sum(-1).mean()
+                stats['Out/val_mean'] += b['val'][:, 1:].sum(-1).mean()
                 stats['Main/loss'] += full_loss
                 stats['Main/policy'] -= policy_loss
                 stats['Main/value'] -= value_loss
                 stats['Val/adv'] -= target_adv_loss
                 stats['Val/tot'] -= joint_value_loss
                 stats['Val/ind'] -= indiv_value_loss
-                stats['Aux/loss'] -= aux_loss
+                stats['Aux/loss'] += aux_loss
                 stats['Main/entropy'] += entropy
                 stats['Main/ratio_diff'] += (ratio - 1.).abs().mean()
 
