@@ -82,9 +82,9 @@ class CartpoleEnv:
         rst_ang = self.was_upright & (self.angle.abs() > self.RESET_ANGLE)
         rst_dur = self.duration > self.MAX_DURATION
 
-        return (rst_pos | rst_ang | rst_dur).float()
+        return (rst_pos | rst_ang | rst_dur).unsqueeze(-1).float()
 
-    def get_observation(self) -> Tensor:
+    def get_observation(self) -> 'tuple[Tensor, Tensor]':
         obs_vec = torch.stack((
             self.pos,
             self.vel,
@@ -103,11 +103,11 @@ class CartpoleEnv:
         rew_ang_vel = self.pos.square().neg_().exp_()   # Max. at 0. ang. vel.
         rew_ang = self.angle.cos().add_(1.).div_(2.)    # Max. at 0. angle
 
-        return rew_vel.mul_(rew_ang_vel).mul_(rew_ang)
+        return rew_vel.mul_(rew_ang_vel).mul_(rew_ang).unsqueeze(-1)
 
-    def step(self, action: Tensor = None, belief: Tensor = None) -> 'tuple[tuple[Tensor, ...], Tensor, Tensor, dict]':
+    def step(self, action: Tensor = None, aux: Tensor = None) -> 'tuple[tuple[Tensor, ...], dict[str, Tensor], dict]':
         if action is None:
-            return self.get_observation(), None, None, self.NULL_DICT
+            return self.get_observation(), None, self.NULL_DICT
 
         *obs, rew, rst = self.step_partial(action.flatten())
         rst_idcs = torch.nonzero(rst, as_tuple=True)[0]
@@ -115,7 +115,11 @@ class CartpoleEnv:
         if len(rst_idcs):
             self.reset(rst_idcs, obs)
 
-        return obs, rew, rst, self.NULL_DICT
+        data = {
+            'rwd': rew,
+            'nrst': 1. - rst}
+
+        return obs, data, self.NULL_DICT
 
     def step_partial(self, action: Tensor) -> 'tuple[Tensor, ...]':
         force = action * self.FORCE_SCALE
@@ -199,7 +203,7 @@ class CartpoleModel(ActorCritic):
             self.rnnp.bias_hh[mem_size:-mem_size].uniform_(1, chrono_len - 1).log_()
             self.rnnv.bias_hh[mem_size:-mem_size].uniform_(1, chrono_len - 1).log_()
 
-    def init_mem(self, batch_size: int = 1) -> 'tuple[Tensor]':
+    def init_mem(self, batch_size: int = 1, other: int = None) -> 'tuple[Tensor, Tensor]':
         memp = self.memp.detach().expand(batch_size, -1).clone()
         memv = self.memv.detach().expand(batch_size, -1).clone()
 
@@ -207,9 +211,9 @@ class CartpoleModel(ActorCritic):
 
     def reset_mem(
         self,
-        mem: 'tuple[Tensor]',
+        mem: 'tuple[Tensor, Tensor]',
         nonreset_mask: Tensor
-    ) -> 'tuple[Tensor]':
+    ) -> 'tuple[Tensor, Tensor]':
 
         memp, memv = mem
 
@@ -218,7 +222,7 @@ class CartpoleModel(ActorCritic):
 
         return memp, memv
 
-    def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool) -> MultiNormal:
+    def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool = False) -> MultiNormal:
         if from_raw:
             return MultiNormal.from_raw(args[:, :1], args[:, 1:])
 
@@ -271,45 +275,58 @@ class CartpoleModel(ActorCritic):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
-        encode: bool
+        sample: 'tuple[Tensor] | None'
     ) -> 'tuple[Tensor, Tensor, None, tuple[Tensor, ...], tuple[Tensor, ...]]':
 
-        if encode:
+        if sample is None:
             x, val_mean, memp, memv = self.collect_static(*obs, *mem)
             obs = obs[0].clone(), obs[1].clone()
 
         else:
             x, val_mean, memp, memv = self.collect_copied(*obs, *mem)
 
-        return x, val_mean, None, obs, (memp, memv)
+        act = self.get_distr(x, from_raw=True)
+
+        if sample is None:
+            sample = act.sample()
+
+        data = {
+            'act': sample,
+            'args': act.args,
+            'val': val_mean,
+            'mem': mem,
+            'obs': obs}
+
+        return data, None, (memp, memv)
 
     def forward(
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
+        sample: 'tuple[Tensor]',
         detach: bool = False
-    ) -> 'tuple[MultiNormal, FixedVarNormal, tuple[Tensor, ...]]':
+    ) -> 'dict[str, MultiNormal | FixedVarNormal | tuple[Tensor, ...]]':
 
         x, v, memp, memv = self.fwd_partial(*obs, *mem, detach=detach)
 
         act = MultiNormal.from_raw(x[:, :1], x[:, 1:])
         val = FixedVarNormal(symexp(v))
 
-        return act, val, (memp, memv)
+        return {
+            'act': act,
+            'val': val,
+            'aux': (),
+            'mem': (memp, memv)}
 
 
 if __name__ == '__main__':
     n_envs = 256
 
-    epoch_milestones = [2, 30, 32]
+    epoch_milestones = [16, 240, 256]
     n_rollout_steps = 256
     n_truncated_steps = 16
     n_main_iters = 8
     n_aux_iters = 6
-
-    n_updates_per_epoch = (
-        n_rollout_steps // n_truncated_steps * n_main_iters
-        + n_rollout_steps * n_main_iters // n_truncated_steps * n_aux_iters)
 
     # Init envs.
     ckpter = CheckpointTracker('cartpole')
@@ -321,7 +338,7 @@ if __name__ == '__main__':
 
     scheduler = AnnealingScheduler(
         optimizer,
-        step_milestones=[ep * n_updates_per_epoch for ep in epoch_milestones],
+        step_milestones=epoch_milestones,
         starting_step=ckpter.meta['update_step'])
 
     # Load last weights
@@ -352,19 +369,18 @@ if __name__ == '__main__':
         env.step,
         ckpter,
         scheduler,
+        n_envs,
         n_epochs=epoch_milestones[-1],
-        log_epoch_interval=1,
+        log_epoch_interval=8,
         ckpt_epoch_interval=0,
         branch_epoch_interval=0,
         n_rollout_steps=n_rollout_steps,
         n_truncated_steps=n_truncated_steps,
-        batch_size=n_envs,
         n_main_iters=n_main_iters,
         n_aux_iters=n_aux_iters,
-        discount_factor=0.98,
+        discount_gammas=0.98,
         entropy_weight=0.,
-        accelerate=accelerate,
-        detach_critic=False)
+        accelerate=accelerate)
 
     try:
         rl_algo.run()

@@ -185,16 +185,18 @@ class InterCategorical(Categorical):
 
 
 class MultiCategorical(Distribution):
-    def __init__(self, value_tpl: 'tuple[Tensor, ...]', log_prob_tpl: 'tuple[Tensor, ...]'):
+    def __init__(self, value_tpl: 'tuple[Tensor, ...]', log_prob_tpl: 'tuple[Tensor, ...]', joint_prob: bool = True):
         self.distrs = [Categorical(*args) for args in zip(value_tpl, log_prob_tpl)]
         self.log_prob_tpl = log_prob_tpl
+        self.joint_prob = joint_prob
 
     @classmethod
     def from_raw(
         cls,
         value_tpl: 'tuple[Tensor, ...]',
         logits: 'Tensor | tuple[Tensor, ...]',
-        logits_are_split: bool = True
+        logits_are_split: bool = True,
+        joint_prob: bool = True
     ) -> 'MultiCategorical':
 
         if logits_are_split:
@@ -205,7 +207,7 @@ class MultiCategorical(Distribution):
 
         log_prob_tpl = tuple([log_softmax(logits, dim=-1) for logits in logit_tpl])
 
-        return cls(value_tpl, log_prob_tpl)
+        return cls(value_tpl, log_prob_tpl, joint_prob)
 
     @cached_property
     def args(self) -> 'tuple[Tensor, ...]':
@@ -241,12 +243,22 @@ class MultiCategorical(Distribution):
     def log_prob(self, _values: Tensor, indices: Tensor) -> Tensor:
         index_stack = indices.transpose(0, 1).unsqueeze(-1)
 
-        return torch.stack([d.log_prob(None, indices) for d, indices in zip(self.distrs, index_stack)]).sum(0)
+        log_prob = torch.stack([d.log_prob(None, indices) for d, indices in zip(self.distrs, index_stack)], dim=-1)
+
+        if self.joint_prob:
+            log_prob = log_prob.sum(-1)
+
+        return log_prob
 
     def prob(self, _values: Tensor, indices: Tensor) -> Tensor:
         index_stack = indices.transpose(0, 1).unsqueeze(-1)
 
-        return torch.stack([d.prob(None, indices) for d, indices in zip(self.distrs, index_stack)]).sum(0)
+        prob = torch.stack([d.prob(None, indices) for d, indices in zip(self.distrs, index_stack)], dim=-1)
+
+        if self.joint_prob:
+            prob = prob.prod(-1)
+
+        return prob
 
     def sample(self) -> 'tuple[Tensor, Tensor]':
         samples = [d.sample() for d in self.distrs]
@@ -268,10 +280,11 @@ class MultiNormal(Continuous):
     _LOG_SQRT_2PIE = 0.5 + _LOG_SQRT_2PI
     _SQRT_2PI = sqrt(2. * pi)
 
-    def __init__(self, mean: Tensor, log_dev: Tensor, dev: Tensor = None):
+    def __init__(self, mean: Tensor, log_dev: Tensor, dev: Tensor = None, joint_prob: bool = True):
         self.mode = self.mean = mean
         self.log_dev = log_dev
         self.dev = log_dev.exp() if dev is None else dev
+        self.joint_prob = joint_prob
 
     @classmethod
     def from_raw(
@@ -280,7 +293,8 @@ class MultiNormal(Continuous):
         pseudo_log_dev: Tensor,
         log_dev_bias: float = None,
         dev_bias: float = None,
-        max_mean: float = None
+        max_mean: float = None,
+        joint_prob: bool = True
     ) -> 'MultiNormal':
 
         if max_mean:
@@ -296,7 +310,7 @@ class MultiNormal(Continuous):
 
         log_dev = dev.log()
 
-        return cls(mean, log_dev, dev)
+        return cls(mean, log_dev, dev, joint_prob)
 
     @cached_property
     def args(self) -> 'tuple[Tensor, ...]':
@@ -320,10 +334,20 @@ class MultiNormal(Continuous):
             + (self.var + (self.mean - other.mean)**2) / other._double_var).sum(-1)
 
     def log_prob(self, values: Tensor) -> Tensor:
-        return -((values - self.mean)**2 / self._double_var + self._LOG_SQRT_2PI + self.log_dev).sum(-1)
+        log_prob = -((values - self.mean)**2 / self._double_var + self._LOG_SQRT_2PI + self.log_dev)
+
+        if self.joint_prob:
+            log_prob = log_prob.sum(-1)
+
+        return log_prob
 
     def prob(self, values: Tensor) -> Tensor:
-        return ((-(values - self.mean)**2 / self._double_var).exp() / (self._SQRT_2PI * self.dev)).prod(-1)
+        prob = ((-(values - self.mean)**2 / self._double_var).exp() / (self._SQRT_2PI * self.dev))
+
+        if self.joint_prob:
+            prob = prob.prod(-1)
+
+        return prob
 
     def sample(self) -> 'tuple[Tensor]':
         return torch.normal(self.mean, self.dev),

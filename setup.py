@@ -10,7 +10,7 @@ with open(os.path.join(os.path.dirname(__file__), 'requirements.txt'), 'r') as f
 
 setup(
     name='discit',
-    version='0.2.1',
+    version='0.2.2',
     description='Discit: Deep Learning Tools',
     long_description=readme,
     long_description_content_type='text/markdown',

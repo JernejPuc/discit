@@ -119,9 +119,9 @@ class MultiOptimizer:
     def __init__(self, **optimizers: Optimizer):
         self.optimizers = optimizers
 
-    def zero_grad(self):
+    def zero_grad(self, set_to_none: bool = True):
         for optimizer in self.optimizers.values():
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none)
 
     def step(self):
         for optimizer in self.optimizers.values():

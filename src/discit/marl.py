@@ -3,14 +3,16 @@
 import os
 from abc import ABC, abstractmethod
 from datetime import timedelta
+from io import BytesIO
 from time import perf_counter
 from typing import Callable
 
 import torch
-from torch import Tensor
+from torch import cuda, Tensor
 from torch.nn import Module
 from torch.utils.tensorboard import SummaryWriter
 
+from .accel import capture_graph
 from .data import ExperienceBuffer, TensorDict
 from .distr import Distribution
 from .optim import MultiOptimizer, MultiScheduler
@@ -21,7 +23,7 @@ class MultiActorCritic(Module, ABC):
     def __init__(self):
         Module.__init__(self)
 
-    def init_mem(self, n_envs: int, n_actors: int) -> 'tuple[Tensor, ...]':
+    def init_mem(self, n_actors: int = None, n_envs: int = None) -> 'tuple[Tensor, ...]':
         return ()
 
     def reset_mem(self, mem: 'tuple[Tensor, ...]', nonreset_mask: Tensor) -> 'tuple[Tensor, ...]':
@@ -31,8 +33,8 @@ class MultiActorCritic(Module, ABC):
     def get_distr(self, args: 'tuple[Tensor, ...]') -> Distribution:
         ...
 
-    def unwrap_sample(self, sample: 'tuple[Tensor, ...]', aux: 'tuple[Tensor, ...]') -> 'tuple[Tensor | None, ...]':
-        return sample[0], None
+    def unwrap_sample(self, act: 'tuple[Tensor, ...]', aux: 'tuple[Tensor, ...]') -> 'tuple[Tensor | None, ...]':
+        return act[0], None
 
     @abstractmethod
     def collect(
@@ -48,7 +50,8 @@ class MultiActorCritic(Module, ABC):
         self,
         obs: 'tuple[Tensor, ...]',
         mem: 'tuple[Tensor, ...]',
-        act: 'tuple[Tensor, ...]'
+        act: 'tuple[Tensor, ...]',
+        detach: bool = True
     ) -> 'dict[str, Distribution | tuple[Distribution, ...] | Tensor | tuple[Tensor, ...]]':
         ...
 
@@ -59,13 +62,14 @@ class AuxTask(ABC):
     def __init__(self, online: bool = False, offline: bool = False):
         self.online = online
         self.offline = offline
+        self.n_update_steps = 0
 
     @abstractmethod
     def clear(self):
         ...
 
     @abstractmethod
-    def collect(self, batch: TensorDict):
+    def collect(self, batch: TensorDict, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]'):
         ...
 
     @abstractmethod
@@ -77,8 +81,8 @@ class AuxTask(ABC):
         self,
         batch: TensorDict,
         act: Distribution,
-        val: 'tuple[Distribution, ...]',
-        aux: 'tuple[Distribution, ...]',
+        vals: 'tuple[Distribution, ...]',
+        auxs: 'tuple[Distribution, ...]',
         stats: 'dict[str, Tensor]'
     ) -> Tensor:
         ...
@@ -125,17 +129,20 @@ class MAXPPO:
         branch_epoch_interval: int = 0,
         n_rollout_steps: int = 1,
         n_truncated_steps: int = 1,
+        n_passes_per_step: int = 1,
         buffer_size: int = None,
         batch_size: int = None,
-        aux_task: AuxTask = None,
         discount_gammas: 'float | tuple[float, ...]' = 0.99,
         trace_lambda: float = 0.95,
         clip_ratio: float = 0.25,
         policy_weight: float = 1.,
         value_weight: float = 0.5,
-        aux_weight: float = 0.,
+        aux_weight: float = 0.5,
         entropy_weight: 'float | Tensor' = 1e-3,
-        log_dir: str = 'runs'
+        aux_task: AuxTask = None,
+        log_dir: str = 'runs',
+        bias_returns: bool = False,
+        accelerate: bool = False
     ):
         if ckpt_tracker.model is None or ckpt_tracker.optimizer is None:
             raise AttributeError('Both model and optimizer must be pre-assigned.')
@@ -146,6 +153,7 @@ class MAXPPO:
         self.n_envs = n_envs
         self.n_actors = n_actors
         self.n_actors_per_env = n_actors // n_envs
+        self.multi_agent = self.n_actors_per_env != 1
         self.n_envs_per_batch, leftover_samples = divmod(batch_size, self.n_actors_per_env)
 
         if leftover_samples:
@@ -167,6 +175,7 @@ class MAXPPO:
 
         self.n_rollout_steps = n_rollout_steps
         self.n_truncated_steps = n_truncated_steps
+        self.n_passes_per_step = n_passes_per_step
         self.buffer_size = buffer_size if buffer_size is not None else n_rollout_steps
 
         self.main_buffer = ExperienceBuffer(self.buffer_size)
@@ -177,6 +186,7 @@ class MAXPPO:
 
         self.discount_gammas = discount_gammas
         self.trace_lambda = trace_lambda
+        self.bias_returns = bias_returns
 
         self.improv_bounds = 1. / (1. + clip_ratio), 1. + clip_ratio
         self.decline_bounds = 1. / (1. + 2*clip_ratio), 1. + 2*clip_ratio
@@ -197,6 +207,10 @@ class MAXPPO:
         self.val = 0.
         self.lr = 0.
 
+        self.accelerate = accelerate
+        self.accel_graph = None
+        self.update_accel = None
+
     def run(self):
         """
         Step the model and env. until enough experiences are recorded to update
@@ -205,7 +219,7 @@ class MAXPPO:
         """
 
         # Initial obs. and mem.
-        mem = self.model.init_mem(self.n_envs, self.n_actors)
+        mem = self.model.init_mem(self.n_actors, self.n_envs)
         obs = self.env_step()[0]
 
         starting_step = epoch_step = self.ckpter.meta['epoch_step']
@@ -218,9 +232,10 @@ class MAXPPO:
             # Estimate time remaining
             progress = epoch_step / self.n_epochs
             running_time = perf_counter() - starting_time
+            load_factor = 2. - self.main_buffer.load_ratio()
 
             remaining_time = min(
-                int(running_time * (self.n_epochs - epoch_step + 1) / max(1, epoch_step - 1 - starting_step)),
+                int(running_time * load_factor * (self.n_epochs-epoch_step+1) / max(1, epoch_step-1-starting_step)),
                 self.MAX_DISP_SECONDS)
 
             self.print_progress(progress, remaining_time, epoch_step)
@@ -244,24 +259,46 @@ class MAXPPO:
                 if self.policy_weight:
                     self.label(obs, mem)
 
+            # Update print-out info
             n_env_steps = (epoch_step - last_log_step) * self.n_rollout_steps
             self.score = self.stats.get('Env/score', self.reward).item() / n_env_steps
 
-            # Update model
-            buffer = self.main_buffer.shuffle(
-                self.ckpter.rng,
-                seq_length=self.n_truncated_steps,
-                n_in_chunks=self.n_envs,
-                n_out_chunks=self.n_envs_per_batch)
+            # Shuffle sequences of batches
+            if self.multi_agent:
+                buffer = self.main_buffer.shuffle(
+                    self.ckpter.rng,
+                    seq_length=self.n_truncated_steps,
+                    n_in_chunks=self.n_envs,
+                    n_out_chunks=self.n_envs_per_batch)
 
+            else:
+                buffer = self.main_buffer.shuffle(self.ckpter.rng, seq_length=self.n_truncated_steps)
+
+            # Iterate over sequences of batches and update the model with epochwise TBPTT
             for seq in buffer.iter_slices(self.n_truncated_steps):
-                if self.policy_weight:
-                    self.update(seq)
+                for _ in range(self.n_passes_per_step):
 
-                if self.aux_task and self.aux_task.offline:
-                    self.aux_task.update(seq, self.stats)
+                    # CUDA graph acceleration
+                    if self.accelerate:
 
-                n_updates += 1
+                        # Flatten content of batches into a list of tensors to pass to the graph
+                        full_input_list = [t for b in seq for t in b.to_list()]
+
+                        # Capture computational graph
+                        if self.accel_graph is None:
+                            self.accel_update(seq, full_input_list)
+
+                        self.update_accel(full_input_list)
+
+                    # Main update
+                    elif self.policy_weight:
+                        self.update(seq)
+
+                    # Auxiliary update
+                    if self.aux_task and self.aux_task.offline:
+                        self.aux_task.update(seq, self.stats)
+
+                n_updates += self.n_passes_per_step
 
             self.scheduler.step()
             self.lr += self.scheduler.lr
@@ -296,12 +333,22 @@ class MAXPPO:
         n_env_steps = self.log_interval * self.n_rollout_steps
         env_step = epoch_step * self.n_rollout_steps
 
+        if self.aux_task and self.aux_task.n_update_steps:
+            n_aux_update_steps = self.aux_task.n_update_steps
+            self.aux_task.n_update_steps = 0
+
+        else:
+            n_aux_update_steps = n_update_steps
+
         for key, val in self.stats.items():
             if key.startswith('GAE'):
                 den = self.log_interval
 
             elif key.startswith('Env'):
                 den = n_env_steps
+
+            elif key.startswith('Aux'):
+                den = n_aux_update_steps
 
             else:
                 den = n_update_steps
@@ -321,15 +368,20 @@ class MAXPPO:
         self.ckpter.checkpoint(epoch_step, update_step, ckpt_increment, self.score)
 
     def collect(self, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]') -> 'tuple[tuple[Tensor, ...], ...]':
+
         # Step actors
-        data, aux_belief, mem = self.model.collect(obs, mem, None)
+        data, aux, mem = self.model.collect(obs, mem, None)
 
         # Step envs.
-        obs, env_data, info = self.env_step(*self.model.unwrap_sample(data['act'], aux_belief))
+        obs, env_data, log_info = self.env_step(*self.model.unwrap_sample(data['act'], aux))
 
         data.update(env_data)
         nrst = data['nrst']
         rwd = data['rwd']
+
+        # Reset memory if any terminal states are reached
+        if not nrst.all():
+            mem = self.model.reset_mem(mem, nrst)
 
         # Add batch to buffers
         d = TensorDict(data)
@@ -337,14 +389,10 @@ class MAXPPO:
         self.main_buffer.append(d)
 
         if self.aux_task:
-            self.aux_task.collect(d)
-
-        # Reset memory if any terminal states are reached
-        if not nrst.all():
-            mem = self.model.reset_mem(mem, nrst)
+            self.aux_task.collect(d, obs, mem)
 
         # Add env. info. to logged metrics
-        for key, val in info.items():
+        for key, val in log_info.items():
             key = f'Env/{key}'
 
             if key not in self.stats:
@@ -358,8 +406,9 @@ class MAXPPO:
         return obs, mem
 
     def recollect(self, b: TensorDict, mem: 'tuple[Tensor, ...]') -> 'tuple[Tensor, ...]':
-        # Step actor
-        data, _, mem = self.model.collect(b['obs'], mem, sample=b['act'])
+
+        # Step actors
+        data, _, mem = self.model.collect(b['obs'], mem, b['act'])
 
         # Update value estimates
         b['val'] = data['val']
@@ -379,8 +428,9 @@ class MAXPPO:
         # Perform an additional critic pass to get the final values used in GAE
         values = self.model.collect(obs, mem, None)[0]['val']
 
-        adv_mean, adv_std = self.main_buffer.multilabel(
-            values, self.discount_gammas, self.trace_lambda, self.n_actors_per_env)
+        # Set or update return targets and advantages
+        adv_mean, adv_std = self.main_buffer.label(
+            values, self.discount_gammas, self.trace_lambda, self.n_actors_per_env, self.bias_returns)
 
         self.stats['GAE/adv_mean'] += adv_mean
         self.stats['GAE/adv_std'] += adv_std
@@ -394,32 +444,43 @@ class MAXPPO:
 
         for b in batches:
             data = self.model(b['obs'], mem, b['act'])
-
-            act: Distribution = data['act']
-            advj: Distribution = data['advj']
-            valj: Distribution = data['valj']
-            vali: Distribution = data['vali']
-            aux: 'tuple[Distribution, ...]' = data['aux']
-
             mem = self.model.reset_mem(data['mem'], b['nrst'])
 
             # Policy
+            act: Distribution = data['act']
             old_act: Distribution = self.model.get_distr(b['args'])
+
             ratio = (act.log_prob(*b['act']) - old_act.log_prob(*b['act'])).exp()
+            advp = b['advp'] if ratio.ndim == 1 else b['advp'].unsqueeze(-1)
 
             policy_loss = torch.minimum(
-                b['advp'] * ratio.clamp(*self.improv_bounds),
-                b['advp'] * ratio.clamp(*self.decline_bounds)).mean()
+                advp * ratio.clamp(*self.improv_bounds),
+                advp * ratio.clamp(*self.decline_bounds)).mean()
 
             # Value
-            target_adv_loss = advj.log_prob(b['advt']).mean()
-            joint_value_loss = valj.log_prob(b['retj']).mean()
-            indiv_value_loss = vali.log_prob(b['reti']).mean()
-            value_loss = target_adv_loss + joint_value_loss + indiv_value_loss
+            if self.multi_agent:
+                advj: Distribution = data['advj']
+                valj: Distribution = data['valj']
+                vali: Distribution = data['vali']
+                vals = valj, vali
+
+                target_adv_loss = advj.log_prob(b['advt']).mean()
+                joint_value_loss = valj.log_prob(b['retj']).mean()
+                indiv_value_loss = vali.log_prob(b['reti']).mean()
+                value_loss = target_adv_loss + joint_value_loss + indiv_value_loss
+
+            else:
+                val: Distribution = data['val']
+                vals = val,
+
+                target_adv_loss = 0.
+                joint_value_loss = 0.
+                indiv_value_loss = val.log_prob(b['ret']).mean()
+                value_loss = indiv_value_loss
 
             # Auxiliary
             if self.aux_task and self.aux_task.online:
-                aux_loss = self.aux_task.loss(b, act, (valj, vali), aux, stats)
+                aux_loss = self.aux_task.loss(b, act, vals, data['aux'], stats)
 
             else:
                 aux_loss = 0.
@@ -440,7 +501,7 @@ class MAXPPO:
             with torch.no_grad():
                 stats['Out/act_mean'] += act.mean.mean()
                 stats['Out/act_std'] += act.dev.mean()
-                stats['Out/val_mean'] += b['val'][:, 1:].sum(-1).mean()
+                stats['Out/val_mean'] += b['val'].sum(-1).mean()
                 stats['Main/loss'] += full_loss
                 stats['Main/policy'] -= policy_loss
                 stats['Main/value'] -= value_loss
@@ -457,3 +518,55 @@ class MAXPPO:
         loss.backward()
 
         self.optimizer.step()
+
+    def accel_update(self, batches: 'list[TensorDict]', inputs: 'list[Tensor]'):
+
+        # Warmup on side stream
+        s = cuda.Stream()
+        s.wait_stream(cuda.current_stream())
+
+        with cuda.stream(s):
+
+            # Get current state
+            stats_values = [v.item() for v in self.stats.values()]
+
+            model_state_bytes = BytesIO()
+            optim_state_bytes = BytesIO()
+
+            torch.save(self.model.state_dict(), model_state_bytes)
+            torch.save(self.optimizer.state_dict(), optim_state_bytes)
+
+            model_state_bytes.seek(0)
+            optim_state_bytes.seek(0)
+
+            # Warmup steps
+            for _ in range(3):
+                self.update(batches)
+
+            # Restore state before warmup
+            for v, v_ in zip(self.stats.values(), stats_values):
+                v.fill_(v_)
+
+            self.model.load_state_dict(torch.load(model_state_bytes))
+            self.optimizer.load_state_dict(torch.load(optim_state_bytes))
+
+            model_state_bytes.close()
+            optim_state_bytes.close()
+
+        cuda.current_stream().wait_stream(s)
+
+        # Restore input structure and relay as actual args.
+        batch_ref = batches[0]
+
+        def update_accel(inputs: 'list[Tensor]'):
+            input_len = len(inputs) // self.n_truncated_steps
+            batches = [batch_ref.from_list(inputs[i:i+input_len]) for i in range(0, len(inputs), input_len)]
+
+            self.update(batches)
+
+        # Capture computational graph
+        self.update_accel, self.accel_graph = capture_graph(
+            update_accel,
+            inputs,
+            warmup_tensor_list=(),
+            single_input=True)
