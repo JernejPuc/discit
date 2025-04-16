@@ -200,7 +200,7 @@ class CheckpointTracker:
 
         print(f'\n{log_text}')
 
-    def load_model(self, model: Module, optimizer: Optimizer = None):
+    def restore(self, model: Module, optimizer: Optimizer = None):
         """Restore model and optimizer params."""
 
         self.model = model.to(self.device)
@@ -214,6 +214,21 @@ class CheckpointTracker:
 
             if not self.transferred and optimizer is not None and (state := ckpt['optim']) is not None:
                 optimizer.load_state_dict(state)
+
+        log_text = f'{"Loaded" if path_exists else "Initialised"} ckpt. ver. {self.meta["ckpt_ver"]}.'
+
+        self.logger.info(log_text)
+
+        print(log_text)
+
+    def load_model(self, model: Module):
+        """Load model params."""
+
+        self.model = model.to(self.device)
+
+        if path_exists := os.path.exists(path := self.meta['model_path']):
+            state = torch.load(path, map_location=self.device)
+            model.load_state_dict(state)
 
         log_text = f'{"Loaded" if path_exists else "Initialised"} model ver. {self.meta["ckpt_ver"]}.'
 

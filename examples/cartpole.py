@@ -343,7 +343,7 @@ if __name__ == '__main__':
 
     # Load last weights
     model.to(ckpter.device)
-    ckpter.load_model(model, optimizer)
+    ckpter.restore(model, optimizer)
 
     # Accelerate env. step
     accelerate = True
