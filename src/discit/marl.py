@@ -121,7 +121,7 @@ class MAXPPO:
             'tuple[tuple[Tensor, ...], dict[str, Tensor | tuple[Tensor, ...]], dict[str, float]]'],
         ckpt_tracker: CheckpointTracker,
         scheduler: MultiScheduler,
-        n_envs: int,
+        n_envs: 'int | Tensor',
         n_actors: int,
         n_epochs: int,
         log_epoch_interval: int = 1,
@@ -147,12 +147,21 @@ class MAXPPO:
         if ckpt_tracker.model is None or ckpt_tracker.optimizer is None:
             raise AttributeError('Both model and optimizer must be pre-assigned.')
 
+        self.n_actors = n_actors
+
         if batch_size is None:
             batch_size = n_actors
 
-        self.n_envs = n_envs
-        self.n_actors = n_actors
-        self.n_actors_per_env = n_actors // n_envs
+        if isinstance(n_envs, int):
+            self.n_envs = n_envs
+            self.env_idcs = None
+            self.n_actors_per_env = n_actors // n_envs
+
+        else:
+            self.n_envs = 1
+            self.env_idcs = n_envs
+            self.n_actors_per_env = n_actors
+
         self.multi_agent = self.n_actors_per_env != 1
         self.n_envs_per_batch, leftover_samples = divmod(batch_size, self.n_actors_per_env)
 
@@ -430,7 +439,7 @@ class MAXPPO:
 
         # Set or update return targets and advantages
         adv_mean, adv_std = self.main_buffer.label(
-            values, self.discount_gammas, self.trace_lambda, self.n_actors_per_env, self.bias_returns)
+            values, self.discount_gammas, self.trace_lambda, self.n_actors_per_env, self.env_idcs, self.bias_returns)
 
         self.stats['GAE/adv_mean'] += adv_mean
         self.stats['GAE/adv_std'] += adv_std

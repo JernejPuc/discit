@@ -525,6 +525,7 @@ class ExperienceBuffer:
         gammas: 'float | Tensor',
         lambda_: float,
         n_actors_per_env: int = 1,
+        irreg_env_indices: Tensor = None,
         bias_returns: bool = False,
         skip_std: bool = False
     ) -> 'tuple[Tensor, Tensor] | None':
@@ -535,6 +536,7 @@ class ExperienceBuffer:
         """
 
         multi_agent = n_actors_per_env != 1
+        env_indices = slice(None, None, n_actors_per_env) if irreg_env_indices is None else irreg_env_indices
 
         # Bootstrap returns
         # NOTE: Final values (future returns) in an episode are assumed to be zeros
@@ -560,11 +562,11 @@ class ExperienceBuffer:
 
             # Value targets and advantages
             if multi_agent:
-                batch['retj'] = returns[::n_actors_per_env, :1]
+                batch['retj'] = returns[env_indices, :1]
                 batch['reti'] = returns[:, 1:]
 
                 # Joint advantage targets
-                batch['advt'] = advantages[::n_actors_per_env, :1]
+                batch['advt'] = advantages[env_indices, :1]
 
                 # Replace joint policy advantages with external advantages
                 adv_ext = batch['nrst'] * batch['advx']
