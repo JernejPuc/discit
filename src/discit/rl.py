@@ -13,6 +13,9 @@ from .optim import LRScheduler
 from .track import CheckpointTracker
 
 
+# ------------------------------------------------------------------------------
+# MARK: PPO
+
 class PPO(MAXPPO):
     """Proximal policy optimisation"""
 
@@ -47,6 +50,7 @@ class PPO(MAXPPO):
     ):
         n_envs = n_actors
         buffer_size = int(n_rollout_steps * n_passes_per_rollout)
+        n_joint_gammas = None
 
         super().__init__(
             env_step, ckpt_tracker, scheduler, n_envs, n_actors, n_epochs,
@@ -54,8 +58,11 @@ class PPO(MAXPPO):
             n_rollout_steps, n_truncated_steps, n_passes_per_step,
             buffer_size, batch_size, discount_gammas, trace_lambda, clip_ratio,
             policy_weight, value_weight, aux_weight, entropy_weight,
-            aux_task, log_dir, bias_returns, accelerate)
+            aux_task, log_dir, n_joint_gammas, bias_returns, accelerate)
 
+
+# ------------------------------------------------------------------------------
+# MARK: PPGAuxTask
 
 class PPGAuxTask(AuxTask):
     STAT_KEYS = ('Aux/value', 'Aux/val_aux', 'Aux/kl_div')
@@ -110,6 +117,9 @@ class PPGAuxTask(AuxTask):
         self.final_inputs: 'tuple[tuple[Tensor, ...], tuple[Tensor, ...], None]' = None
         self.stats: dict[str, Tensor] = {k: 0. for k in self.STAT_KEYS}
 
+    # --------------------------------------------------------------------------
+    # MARK: collect
+
     def clear(self):
         self.aux_buffer.clear(self.n_rollout_steps)
 
@@ -142,6 +152,9 @@ class PPGAuxTask(AuxTask):
         # Update return targets
         self.aux_buffer.label(
             values, self.discount_gammas, self.trace_lambda, bias_returns=self.bias_returns, skip_std=True)
+
+    # --------------------------------------------------------------------------
+    # MARK: update
 
     def update(self, batches: 'list[TensorDict]', stats: 'dict[str, Tensor]'):
         if not self.aux_buffer.is_full():
@@ -180,6 +193,9 @@ class PPGAuxTask(AuxTask):
 
                 self.n_update_steps += self.n_truncated_steps
 
+    # --------------------------------------------------------------------------
+    # MARK: update_single
+
     def update_single(self, batches: 'list[TensorDict]'):
         stats = self.stats
         running_loss = 0.
@@ -199,6 +215,9 @@ class PPGAuxTask(AuxTask):
         running_loss.backward()
 
         self.optimizer.step()
+
+    # --------------------------------------------------------------------------
+    # MARK: loss
 
     def loss(
         self,
@@ -238,6 +257,9 @@ class PPGAuxTask(AuxTask):
 
         return loss
 
+    # --------------------------------------------------------------------------
+    # MARK: accel_update
+
     def accel_update(self, batches: 'list[TensorDict]', inputs: 'list[Tensor]'):
 
         # NOTE: Repeating warmup here resulted in illegal CUDA memory access errors
@@ -259,6 +281,9 @@ class PPGAuxTask(AuxTask):
             warmup_tensor_list=(),
             single_input=True)
 
+
+# ------------------------------------------------------------------------------
+# MARK: PPG
 
 class PPG(MAXPPO):
     """Phasic policy gradients"""
@@ -296,6 +321,7 @@ class PPG(MAXPPO):
     ):
         n_envs = n_actors
         buffer_size = int(n_rollout_steps * n_passes_per_rollout)
+        n_joint_gammas = None
 
         aux_task = PPGAuxTask(
             ckpt_tracker,
@@ -310,4 +336,4 @@ class PPG(MAXPPO):
             n_rollout_steps, n_truncated_steps, n_passes_per_step,
             buffer_size, batch_size, discount_gammas, trace_lambda, clip_ratio,
             policy_weight, value_weight, aux_weight, entropy_weight,
-            aux_task, log_dir, bias_returns, accelerate)
+            aux_task, log_dir, n_joint_gammas, bias_returns, accelerate)

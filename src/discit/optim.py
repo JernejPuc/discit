@@ -8,6 +8,9 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 
+# ------------------------------------------------------------------------------
+# MARK: NAdamW
+
 class NAdamW(Optimizer):
     """Adam with Nesterov momentum and decoupled weight decay."""
 
@@ -113,6 +116,9 @@ class NAdamW(Optimizer):
                 param.addcdiv_(exp_avg * momentum_step, denom)                  # value
 
 
+# ------------------------------------------------------------------------------
+# MARK: MultiOptimizer
+
 class MultiOptimizer:
     """Wrapper to step multiple optimizers together."""
 
@@ -134,6 +140,9 @@ class MultiOptimizer:
         for key, state_dict in state_dicts.items():
             self.optimizers[key].load_state_dict(state_dict)
 
+
+# ------------------------------------------------------------------------------
+# MARK: LRScheduler
 
 class LRScheduler:
     """Constant learning rate scheduler that only increments the step counter."""
@@ -176,6 +185,9 @@ class LRScheduler:
     def load_state_dict(self, state_dict: 'dict[str, Any]'):
         self.__dict__.update(state_dict)
 
+
+# ------------------------------------------------------------------------------
+# MARK: AnnealingScheduler
 
 class AnnealingScheduler(LRScheduler):
     """
@@ -276,6 +288,9 @@ class AnnealingScheduler(LRScheduler):
         return start + (end - start) * ratio
 
 
+# ------------------------------------------------------------------------------
+# MARK: PlateauReducingScheduler
+
 class PlateauReducingScheduler(LRScheduler):
     """Reduces LR on plateau, i.e. when a metric has stopped improving."""
 
@@ -333,6 +348,9 @@ class PlateauReducingScheduler(LRScheduler):
         LRScheduler.update(self, scheduler)
 
 
+# ------------------------------------------------------------------------------
+# MARK: BoundingScheduler
+
 class BoundingScheduler(LRScheduler):
     """
     Decreases the learning rate if the tracked value average exceeds
@@ -388,6 +406,9 @@ class BoundingScheduler(LRScheduler):
         self.update_args()
 
 
+# ------------------------------------------------------------------------------
+# MARK: CoeffScheduler
+
 class CoeffScheduler:
     step_ctr: int
 
@@ -432,6 +453,9 @@ class CoeffScheduler:
     def load_state_dict(self, state_dict: 'dict[str, Any]'):
         self.__dict__.update(state_dict)
 
+
+# ------------------------------------------------------------------------------
+# MARK: MultiScheduler
 
 class MultiScheduler:
     """Wrapper to step multiple schedulers together."""

@@ -8,6 +8,9 @@ from numpy.typing import ArrayLike
 from torch import cuda, Tensor
 
 
+# ------------------------------------------------------------------------------
+# MARK: LoadedDataset
+
 class LoadedDataset:
     """Iterator slicing through data that is fully loaded on the target device."""
 
@@ -57,6 +60,9 @@ class LoadedDataset:
 
         return self.data[curr_iter_ptr:self.iter_ptr]
 
+
+# ------------------------------------------------------------------------------
+# MARK: SideLoadingDataset
 
 class SideLoadingDataset:
     """
@@ -141,6 +147,9 @@ class SideLoadingDataset:
 
         return batch
 
+
+# ------------------------------------------------------------------------------
+# MARK: TensorDict
 
 class TensorDict(dict):
     """Wrapper around a dict with assumptions for key and value content."""
@@ -231,6 +240,9 @@ class TensorDict(dict):
             for k, v in self.items()})
 
 
+# ------------------------------------------------------------------------------
+# MARK: ExperienceBuffer
+
 class ExperienceBuffer:
     """
     Wrapper around a list with capped length, storing state transitions
@@ -240,7 +252,7 @@ class ExperienceBuffer:
     of different sizes or changes to the buffer mid-iteration.
     """
 
-    def __init__(self, buffer_len: int, data: 'tuple[list[TensorDict | None], int]' = None):
+    def __init__(self, buffer_len: int, data: 'tuple[list[TensorDict | None], int, Tensor, Tensor]' = None):
         if buffer_len < 1:
             raise ValueError(f'Invalid buffer length: {buffer_len}')
 
@@ -252,9 +264,13 @@ class ExperienceBuffer:
         if data is None:
             self.batches: 'list[TensorDict]' = []
             self.bind_ptr = 0
+            self.min_returns = self.max_returns = None
 
         else:
-            self.batches, self.bind_ptr = data
+            self.batches, self.bind_ptr, self.min_returns, self.max_returns = data
+
+    # --------------------------------------------------------------------------
+    # MARK: clear
 
     def clear(self, n_clear: int = None):
         if n_clear is None or n_clear >= self.buffer_len:
@@ -290,6 +306,9 @@ class ExperienceBuffer:
 
         except IndexError as err:
             raise RuntimeError('Tried to infer device from empty buffer.') from err
+
+    # --------------------------------------------------------------------------
+    # MARK: extend
 
     def extend(self, buffer: 'ExperienceBuffer'):
         if self.buffer_len < (self.bind_ptr + len(buffer)):
@@ -328,7 +347,7 @@ class ExperienceBuffer:
             batches = self.batches[arg]
             bind_ptr = min(self.bind_ptr, len(batches))
 
-            return ExperienceBuffer(self.buffer_len, data=(batches, bind_ptr))
+            return ExperienceBuffer(self.buffer_len, data=(batches, bind_ptr, self.min_returns, self.max_returns))
 
         if isinstance(arg, tuple):
             buffer_arg, batch_arg = arg
@@ -348,6 +367,9 @@ class ExperienceBuffer:
 
     def __len__(self) -> int:
         return self.bind_ptr
+
+    # --------------------------------------------------------------------------
+    # MARK: __iter__
 
     def __iter__(self) -> 'ExperienceBuffer':
         self.iter_ptr = -self.iter_step
@@ -387,6 +409,9 @@ class ExperienceBuffer:
 
         return iter(self)
 
+    # --------------------------------------------------------------------------
+    # MARK: shuffle
+
     def shuffle(
         self,
         rng: np.random.Generator,
@@ -410,13 +435,16 @@ class ExperienceBuffer:
         # Flatten list into buffer
         batches = [b for batches in seq_list for b in batches]
 
-        buffer = ExperienceBuffer(len(batches), data=(batches, len(batches)))
+        buffer = ExperienceBuffer(len(batches), data=(batches, len(batches), self.min_returns, self.max_returns))
 
         # Stack if necessary
         if n_out_chunks > 1:
             buffer = buffer.stack(n_out_chunks)
 
         return buffer
+
+    # --------------------------------------------------------------------------
+    # MARK: sample
 
     def sample(
         self,
@@ -464,6 +492,9 @@ class ExperienceBuffer:
 
         return [batch_ref.cat_alike(batches[i::seq_length]) for i in range(seq_length)]
 
+    # --------------------------------------------------------------------------
+    # MARK: restack
+
     def restack(self, n_to_unstack: int, rng: np.random.Generator = None) -> 'ExperienceBuffer':
         """Change batch size based on the argument's sign."""
 
@@ -490,7 +521,7 @@ class ExperienceBuffer:
 
         batches = [batch_ref.cat_alike(batches[i::slice_len]) for i in range(slice_len)]
 
-        return ExperienceBuffer(slice_len, data=(batches, slice_len))
+        return ExperienceBuffer(slice_len, data=(batches, slice_len, self.min_returns, self.max_returns))
 
     def unstack(self, n_slices: int, rng: np.random.Generator = None) -> 'ExperienceBuffer':
         """Reduce batch size by splitting batches into multiple buffer slices."""
@@ -517,13 +548,17 @@ class ExperienceBuffer:
 
         batches = [b.slice(s) for s in slices for b in batches]
 
-        return ExperienceBuffer(buffer_len, data=(batches, buffer_len))
+        return ExperienceBuffer(buffer_len, data=(batches, buffer_len, self.min_returns, self.max_returns))
+
+    # --------------------------------------------------------------------------
+    # MARK: label
 
     def label(
         self,
         values: Tensor,
         gammas: 'float | Tensor',
         lambda_: float,
+        n_joint_gammas: int = 1,
         n_actors_per_env: int = 1,
         irreg_env_indices: Tensor = None,
         bias_returns: bool = False,
@@ -538,6 +573,13 @@ class ExperienceBuffer:
         multi_agent = n_actors_per_env != 1
         env_indices = slice(None, None, n_actors_per_env) if irreg_env_indices is None else irreg_env_indices
 
+        # Init. return envelope to bound bootstrapped estimates
+        if self.min_returns is None:
+            self.min_returns = torch.zeros((1, len(gammas)), device=values.device)
+            self.max_returns = torch.zeros((1, len(gammas)), device=values.device)
+
+        values = values.clamp(self.min_returns, self.max_returns)
+
         # Bootstrap returns
         # NOTE: Final values (future returns) in an episode are assumed to be zeros
         # Earlier returns are based (bootstrapped) on the model's estimates
@@ -546,12 +588,13 @@ class ExperienceBuffer:
 
         for batch in reversed(self.batches):
             nrst_gammas = batch['nrst'] * gammas
+            prev_values = batch['val'].clamp(self.min_returns, self.max_returns)
 
             # GAE
-            deltas = batch['rwd'] + nrst_gammas * values - batch['val']
+            deltas = batch['rwd'] + nrst_gammas * values - prev_values
             advantages = deltas + nrst_gammas * lambda_ * advantages
 
-            values = batch['val']
+            values = prev_values
 
             # Biased or discounted sum
             if bias_returns:
@@ -559,23 +602,26 @@ class ExperienceBuffer:
 
             else:
                 returns = batch['rwd'] + nrst_gammas * returns
+                self.min_returns = torch.minimum(self.min_returns, returns.min(0, keepdim=True)[0])
+                self.max_returns = torch.maximum(self.max_returns, returns.max(0, keepdim=True)[0])
 
             # Value targets and advantages
             if multi_agent:
-                batch['retj'] = returns[env_indices, :1]
-                batch['reti'] = returns[:, 1:]
+                batch['retj'] = returns[env_indices, :n_joint_gammas]
+                batch['reti'] = returns[:, n_joint_gammas:]
 
                 # Joint advantage targets
-                batch['advt'] = advantages[env_indices, :1]
+                batch['advt'] = advantages[env_indices, :n_joint_gammas]
 
                 # Replace joint policy advantages with external advantages
                 adv_ext = batch['nrst'] * batch['advx']
 
-                batch['advp'] = adv_ext.sum(-1) + advantages[:, 1:].sum(-1)
+                # To be standardised separately
+                batch['advp'] = torch.stack((adv_ext.sum(-1), advantages[:, n_joint_gammas:].sum(-1)), dim=-1)
 
             else:
                 batch['ret'] = returns
-                batch['advp'] = advantages.sum(-1)
+                batch['advp'] = advantages.sum(-1, keepdim=True)
 
         if skip_std:
             return
@@ -583,7 +629,7 @@ class ExperienceBuffer:
         # Only force expectation of zero mean for adv. target
         if multi_agent:
             adv_tar = torch.stack([batch['advt'] for batch in self.batches])
-            adv_tar = adv_tar - adv_tar.mean()
+            adv_tar = adv_tar - adv_tar.mean((0, 1))
 
             for i, batch in enumerate(self.batches):
                 batch['advt'] = adv_tar[i]
@@ -592,13 +638,14 @@ class ExperienceBuffer:
         # NOTE: Standardisation works best over the whole rollout (more samples, fewer gaps)
         adv_pi = torch.stack([batch['advp'] for batch in self.batches])
 
-        adv_mean = adv_pi.mean()
-        adv_std = adv_pi.std()
+        adv_mean = adv_pi.mean((0, 1))
+        adv_std = adv_pi.std((0, 1))
 
         # NOTE: Div. by scale is clipped to limit the magnitude of sparse rewards (max. 100x larger)
         adv_pi = (adv_pi - adv_mean) / adv_std.clip(0.01)
+        adv_pi = adv_pi.sum(-1)
 
         for i, batch in enumerate(self.batches):
             batch['advp'] = adv_pi[i]
 
-        return adv_mean, adv_std
+        return adv_mean.mean(), adv_std.mean()

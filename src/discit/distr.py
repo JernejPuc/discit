@@ -9,6 +9,9 @@ from torch import Tensor
 from torch.nn.functional import log_softmax, softplus
 
 
+# ------------------------------------------------------------------------------
+# MARK: Distribution
+
 class Distribution:
     args: 'tuple[Tensor, ...]'
     mean: Tensor
@@ -31,6 +34,9 @@ class Discrete(Distribution):
     log_probs: Tensor
     probs: Tensor
 
+
+# ------------------------------------------------------------------------------
+# MARK: MultiMixed
 
 class MultiMixed(Distribution):
     def __init__(self, mcat: 'MultiCategorical', mnor: 'MultiNormal'):
@@ -80,6 +86,9 @@ class MultiMixed(Distribution):
 
         return torch.cat((values_mcat, values_mnor), dim=-1), values_mnor, indices_mcat
 
+
+# ------------------------------------------------------------------------------
+# MARK: Categorical
 
 class ProdCategorical(Discrete):
     """
@@ -153,6 +162,9 @@ class ProdCategorical(Discrete):
 Categorical = ProdCategorical
 
 
+# ------------------------------------------------------------------------------
+# MARK: InterCategorical
+
 class InterCategorical(Categorical):
     """
     Categorical distribution where values stand for delimiters between bins.
@@ -183,6 +195,9 @@ class InterCategorical(Categorical):
     def prob(self, values: Tensor, _indices: Tensor = None) -> Tensor:
         return self._lerp_between(self.probs, values)
 
+
+# ------------------------------------------------------------------------------
+# MARK: MultiCategorical
 
 class MultiCategorical(Distribution):
     def __init__(self, value_tpl: 'tuple[Tensor, ...]', log_prob_tpl: 'tuple[Tensor, ...]', joint_prob: bool = True):
@@ -269,6 +284,9 @@ class MultiCategorical(Distribution):
         return values, indices
 
 
+# ------------------------------------------------------------------------------
+# MARK: MultiNormal
+
 class MultiNormal(Continuous):
     """
     Multivariate normal with diagonal covariance matrix,
@@ -352,6 +370,9 @@ class MultiNormal(Continuous):
     def sample(self) -> 'tuple[Tensor]':
         return torch.normal(self.mean, self.dev),
 
+
+# ------------------------------------------------------------------------------
+# MARK: FixedVarNormal
 
 class FixedVarNormal(Continuous):
     """

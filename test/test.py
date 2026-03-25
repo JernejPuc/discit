@@ -10,7 +10,14 @@ RNG_SEED = 0
 BATCH_SIZE = 256
 
 
+# ------------------------------------------------------------------------------
+# MARK: TestDistributions
+
 class TestDistributions(unittest.TestCase):
+
+    # --------------------------------------------------------------------------
+    # MARK: test_multi_mixed
+
     def test_multi_mixed(self):
         rng = np.random.default_rng(RNG_SEED)
 
@@ -66,6 +73,9 @@ class TestDistributions(unittest.TestCase):
         self.assertEqual(sample_mcat_idcs.shape[0], BATCH_SIZE)
         self.assertEqual(sample_mcat_idcs.shape[1], 1)
 
+    # --------------------------------------------------------------------------
+    # MARK: test_multi_categorical
+
     def test_multi_categorical(self):
         rng = np.random.default_rng(RNG_SEED)
 
@@ -115,6 +125,9 @@ class TestDistributions(unittest.TestCase):
         self.assertEqual(sample_idcs.shape[0], BATCH_SIZE)
         self.assertEqual(sample_idcs.shape[1], 1)
 
+    # --------------------------------------------------------------------------
+    # MARK: test_inter_categorical
+
     def test_inter_categorical(self):
         rng = np.random.default_rng(RNG_SEED)
 
@@ -136,6 +149,9 @@ class TestDistributions(unittest.TestCase):
         for i, attr in enumerate((prob, log_prob)):
             self.assertEqual(len(attr.shape), 1, i)
             self.assertEqual(len(attr), BATCH_SIZE, i)
+
+    # --------------------------------------------------------------------------
+    # MARK: test_multi_normal
 
     def test_multi_normal(self):
         rng = np.random.default_rng(RNG_SEED)
@@ -166,6 +182,9 @@ class TestDistributions(unittest.TestCase):
         for i, attr in enumerate((distr.entropy, prob, log_prob, kl_div)):
             self.assertEqual(len(attr.shape), 1, i)
             self.assertEqual(len(attr), BATCH_SIZE, i)
+
+    # --------------------------------------------------------------------------
+    # MARK: test_fixed_var_normal
 
     def test_fixed_var_normal(self):
         rng = np.random.default_rng(RNG_SEED)

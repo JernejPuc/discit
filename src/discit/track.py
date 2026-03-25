@@ -12,6 +12,9 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 
+# ------------------------------------------------------------------------------
+# MARK: CheckpointTracker
+
 class CheckpointTracker:
     meta: 'dict[str, Any]'
     rng: np.random.Generator
@@ -51,6 +54,9 @@ class CheckpointTracker:
         self.model: 'Module | None' = None
         self.optimizer: 'Optimizer | None' = None
         self.transferred = bool(transfer_name)
+
+    # --------------------------------------------------------------------------
+    # MARK: resume
 
     def resume(self, seed: int, transfer_name: str, ver_to_transfer: int, reset_step_on_transfer: bool):
         """Initialise the first or load the last checkpoint data of the current model."""
@@ -145,6 +151,9 @@ class CheckpointTracker:
 
         print(log_text)
 
+    # --------------------------------------------------------------------------
+    # MARK: update
+
     def update(self, epoch_step: int = 0, update_step: int = 0, ckpt_increment: int = 0, score: float = None):
         self.meta['ckpt_ctr'] += 1
         self.meta['ckpt_ver'] += ckpt_increment
@@ -153,6 +162,9 @@ class CheckpointTracker:
         self.meta['perf_score'] = score
         self.meta['model_path'] = os.path.join(self.data_dir, f'model_{self.meta["ckpt_ver"]:03d}.pt')
         self.meta['ckpt_path'] = os.path.join(self.data_dir, f'ckpt_{self.meta["ckpt_ver"]:03d}.pt')
+
+    # --------------------------------------------------------------------------
+    # MARK: checkpoint
 
     def checkpoint(self, epoch_step: int = 0, update_step: int = 0, ckpt_increment: int = 0, score: float = None):
         """Save current data."""
@@ -200,6 +212,9 @@ class CheckpointTracker:
 
         print(f'\n{log_text}')
 
+    # --------------------------------------------------------------------------
+    # MARK: restore
+
     def restore(self, model: Module, optimizer: Optimizer = None):
         """Restore model and optimizer params."""
 
@@ -220,6 +235,9 @@ class CheckpointTracker:
         self.logger.info(log_text)
 
         print(log_text)
+
+    # --------------------------------------------------------------------------
+    # MARK: load_model
 
     def load_model(self, model: Module):
         """Load model params."""

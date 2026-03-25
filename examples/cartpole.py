@@ -9,6 +9,9 @@ from discit.rl import ActorCritic, PPG
 from discit.track import CheckpointTracker
 
 
+# ------------------------------------------------------------------------------
+# MARK: CartpoleEnv
+
 class CartpoleEnv:
     """
     Reference:
@@ -41,6 +44,9 @@ class CartpoleEnv:
         self.device = device
 
         self.pos, self.vel, self.angle, self.ang_vel, self.was_upright, self.duration = self.random_init(n_envs)
+
+    # --------------------------------------------------------------------------
+    # MARK: reset
 
     def random_init(self, n_envs: int) -> 'tuple[Tensor, ...]':
         pos, vel, angle, ang_vel = torch.empty((4, n_envs), device=self.device).uniform_(-0.05, 0.05)
@@ -84,6 +90,9 @@ class CartpoleEnv:
 
         return (rst_pos | rst_ang | rst_dur).unsqueeze(-1).float()
 
+    # --------------------------------------------------------------------------
+    # MARK: get_observation
+
     def get_observation(self) -> 'tuple[Tensor, Tensor]':
         obs_vec = torch.stack((
             self.pos,
@@ -98,12 +107,18 @@ class CartpoleEnv:
 
         return obs_vec, obs_aux
 
+    # --------------------------------------------------------------------------
+    # MARK: get_reward
+
     def get_reward(self) -> Tensor:
         rew_vel = self.vel.square().neg_().exp_()       # Max. at 0. vel.
         rew_ang_vel = self.pos.square().neg_().exp_()   # Max. at 0. ang. vel.
         rew_ang = self.angle.cos().add_(1.).div_(2.)    # Max. at 0. angle
 
         return rew_vel.mul_(rew_ang_vel).mul_(rew_ang).unsqueeze(-1)
+
+    # --------------------------------------------------------------------------
+    # MARK: step
 
     def step(self, action: Tensor = None, aux: Tensor = None) -> 'tuple[tuple[Tensor, ...], dict[str, Tensor], dict]':
         if action is None:
@@ -157,6 +172,9 @@ class CartpoleEnv:
         return *obs, rew, rst
 
 
+# ------------------------------------------------------------------------------
+# MARK: CartpoleModel
+
 # Overkill for cartpole, but the point is to test the components, not just solve cartpole
 class CartpoleModel(ActorCritic):
     def __init__(
@@ -203,11 +221,17 @@ class CartpoleModel(ActorCritic):
             self.rnnp.bias_hh[mem_size:-mem_size].uniform_(1, chrono_len - 1).log_()
             self.rnnv.bias_hh[mem_size:-mem_size].uniform_(1, chrono_len - 1).log_()
 
+    # --------------------------------------------------------------------------
+    # MARK: init_mem
+
     def init_mem(self, batch_size: int = 1, other: int = None) -> 'tuple[Tensor, Tensor]':
         memp = self.memp.detach().expand(batch_size, -1).clone()
         memv = self.memv.detach().expand(batch_size, -1).clone()
 
         return memp, memv
+
+    # --------------------------------------------------------------------------
+    # MARK: reset_mem
 
     def reset_mem(
         self,
@@ -222,6 +246,9 @@ class CartpoleModel(ActorCritic):
 
         return memp, memv
 
+    # --------------------------------------------------------------------------
+    # MARK: get_distr
+
     def get_distr(self, args: 'Tensor | tuple[Tensor, ...]', from_raw: bool = False) -> MultiNormal:
         if from_raw:
             return MultiNormal.from_raw(args[:, :1], args[:, 1:])
@@ -230,6 +257,9 @@ class CartpoleModel(ActorCritic):
 
     def act(self, *args, **kwargs):
         raise NotImplementedError
+
+    # --------------------------------------------------------------------------
+    # MARK: collect
 
     def fwd_partial(
         self,
@@ -299,6 +329,9 @@ class CartpoleModel(ActorCritic):
 
         return data, None, (memp, memv)
 
+    # --------------------------------------------------------------------------
+    # MARK: forward
+
     def forward(
         self,
         obs: 'tuple[Tensor, ...]',
@@ -318,6 +351,9 @@ class CartpoleModel(ActorCritic):
             'aux': (),
             'mem': (memp, memv)}
 
+
+# ------------------------------------------------------------------------------
+# MARK: Main
 
 if __name__ == '__main__':
     n_envs = 256

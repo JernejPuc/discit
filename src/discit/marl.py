@@ -19,6 +19,9 @@ from .optim import MultiOptimizer, MultiScheduler
 from .track import CheckpointTracker
 
 
+# ------------------------------------------------------------------------------
+# MARK: MultiActorCritic
+
 class MultiActorCritic(Module, ABC):
     def __init__(self):
         Module.__init__(self)
@@ -56,6 +59,9 @@ class MultiActorCritic(Module, ABC):
         ...
 
 
+# ------------------------------------------------------------------------------
+# MARK: AuxTask
+
 class AuxTask(ABC):
     STAT_KEYS = ()
 
@@ -88,6 +94,9 @@ class AuxTask(ABC):
         ...
 
 
+# ------------------------------------------------------------------------------
+# MARK: MAXPPO
+
 class MAXPPO:
     """
     Multi-agent variant of PPO with joint targets and external
@@ -99,7 +108,7 @@ class MAXPPO:
     STAT_KEYS = (
         'Out/act_mean',
         'Out/act_std',
-        'Out/val_mean',
+        'Out/val_mean_0',
         'Env/reward',
         'Env/resets',
         'Main/loss',
@@ -141,6 +150,7 @@ class MAXPPO:
         entropy_weight: 'float | Tensor' = 1e-3,
         aux_task: AuxTask = None,
         log_dir: str = 'runs',
+        n_joint_gammas: int = None,
         bias_returns: bool = False,
         accelerate: bool = False
     ):
@@ -195,6 +205,7 @@ class MAXPPO:
 
         self.discount_gammas = discount_gammas
         self.trace_lambda = trace_lambda
+        self.n_joint_gammas = n_joint_gammas if n_joint_gammas is not None else 1
         self.bias_returns = bias_returns
 
         self.improv_bounds = 1. / (1. + clip_ratio), 1. + clip_ratio
@@ -206,6 +217,10 @@ class MAXPPO:
         self.entropy_weight = entropy_weight
 
         self.stats = {k: torch.tensor(0., device=self.ckpter.device) for k in self.STAT_KEYS}
+
+        if hasattr(discount_gammas, '__len__'):
+            for i in range(1, discount_gammas.shape[-1]):
+                self.stats[f'Out/val_mean_{i}'] = torch.tensor(0., device=self.ckpter.device)
 
         if aux_task:
             for k in aux_task.STAT_KEYS:
@@ -219,6 +234,9 @@ class MAXPPO:
         self.accelerate = accelerate
         self.accel_graph = None
         self.update_accel = None
+
+    # --------------------------------------------------------------------------
+    # MARK: run
 
     def run(self):
         """
@@ -330,12 +348,18 @@ class MAXPPO:
         self.checkpoint(epoch_step)
         self.writer.close()
 
+    # --------------------------------------------------------------------------
+    # MARK: print_progress
+
     def print_progress(self, progress: float, remaining_time: float, epoch_step: int):
         print(
             f'\rEpoch {epoch_step} of {self.n_epochs} ({progress:.2f}) | '
             f'ETA: {str(timedelta(seconds=remaining_time))} | '
             f'Score: {self.score: .3f}   ',
             end='')
+
+    # --------------------------------------------------------------------------
+    # MARK: log
 
     def log(self, epoch_step: int, n_updates: int):
         n_update_steps = n_updates * self.n_truncated_steps
@@ -370,11 +394,17 @@ class MAXPPO:
         self.lr = 0.
         self.val = 0.
 
+    # --------------------------------------------------------------------------
+    # MARK: checkpoint
+
     def checkpoint(self, epoch_step: int, branch: bool = False):
         update_step = self.scheduler.step_ctr
         ckpt_increment = 1 if branch else 0
 
         self.ckpter.checkpoint(epoch_step, update_step, ckpt_increment, self.score)
+
+    # --------------------------------------------------------------------------
+    # MARK: collect
 
     def collect(self, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]') -> 'tuple[tuple[Tensor, ...], ...]':
 
@@ -414,6 +444,9 @@ class MAXPPO:
 
         return obs, mem
 
+    # --------------------------------------------------------------------------
+    # MARK: recollect
+
     def recollect(self, b: TensorDict, mem: 'tuple[Tensor, ...]') -> 'tuple[Tensor, ...]':
 
         # Step actors
@@ -432,6 +465,9 @@ class MAXPPO:
 
         return mem
 
+    # --------------------------------------------------------------------------
+    # MARK: label
+
     def label(self, obs: 'tuple[Tensor, ...]', mem: 'tuple[Tensor, ...]'):
 
         # Perform an additional critic pass to get the final values used in GAE
@@ -439,10 +475,19 @@ class MAXPPO:
 
         # Set or update return targets and advantages
         adv_mean, adv_std = self.main_buffer.label(
-            values, self.discount_gammas, self.trace_lambda, self.n_actors_per_env, self.env_idcs, self.bias_returns)
+            values,
+            self.discount_gammas,
+            self.trace_lambda,
+            self.n_joint_gammas,
+            self.n_actors_per_env,
+            self.env_idcs,
+            self.bias_returns)
 
         self.stats['GAE/adv_mean'] += adv_mean
         self.stats['GAE/adv_std'] += adv_std
+
+    # --------------------------------------------------------------------------
+    # MARK: update
 
     def update(self, batches: 'list[TensorDict]'):
         stats = self.stats
@@ -510,7 +555,10 @@ class MAXPPO:
             with torch.no_grad():
                 stats['Out/act_mean'] += act.mean.mean()
                 stats['Out/act_std'] += act.dev.mean()
-                stats['Out/val_mean'] += b['val'].sum(-1).mean()
+
+                for i, val_i in enumerate(b['val'].mean(0)):
+                    stats[f'Out/val_mean_{i}'] += val_i
+
                 stats['Main/loss'] += full_loss
                 stats['Main/policy'] -= policy_loss
                 stats['Main/value'] -= value_loss
@@ -527,6 +575,9 @@ class MAXPPO:
         loss.backward()
 
         self.optimizer.step()
+
+    # --------------------------------------------------------------------------
+    # MARK: accel_update
 
     def accel_update(self, batches: 'list[TensorDict]', inputs: 'list[Tensor]'):
 
